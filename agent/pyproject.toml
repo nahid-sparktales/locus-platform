@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ollama-code"
+version = "0.3.0"
+description = "A local coding agent powered by Ollama, with a CLI and the REST/WebSocket service behind Locus for macOS."
+readme = "README.md"
+requires-python = ">=3.10"
+# Matches the repository's LICENSE. This said MIT before Locus had a LICENSE
+# file at all, which made it the only licensing claim in the tree and a
+# contradictory one.
+license = "Apache-2.0"
+license-files = ["../LICENSE"]
+dependencies = [
+    "requests>=2.31",
+    "rich>=13.7",
+    "prompt_toolkit>=3.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "websockets>=12.0",
+    "cryptography>=50.0",
+    "mcp==2.0.0",
+    "opentelemetry-sdk==1.44.0",
+    "opentelemetry-exporter-otlp-proto-http==1.44.0",
+    # SOCKS proxy support, for requests and httpx respectively — kept in both
+    # this file and requirements-runtime.in so a dev install proxies the same
+    # way the bundled runtime does.
+    "pysocks>=1.7.1",
+    "socksio>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "httpx2>=2.9,<3", "pip-audit>=2.9,<3", "ruff>=0.12"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = [
+    # FastAPI's dependency marker calls are the framework's documented API.
+    "B008",
+    # Long human-facing prompts and JSON schemas are clearer left intact.
+    "E501",
+]
+
+[project.scripts]
+ollama-code = "ollama_code.app:main"
+ollama-code-server = "ollama_code.server:main"
+
+[tool.setuptools.packages.find]
+include = ["ollama_code*"]
+
+# Deliberately no [tool.pytest.ini_options] here: a second pytest config in this
+# directory made `cd agent && pytest` treat `agent` as the rootdir, which is a
+# different rootdir than CI uses and which put agent/tests/conftest.py outside
+# pytest's confcutdir in some invocations. The repo-root pytest.ini is the only
+# pytest configuration.

@@ -1,0 +1,19 @@
+{
+  "name": "@locus/browser-bridge",
+  "version": "0.1.0",
+  "description": "Engine-neutral isolated-world DOM bridge for Locus browser tools",
+  "type": "module",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run src"
+  }
+}

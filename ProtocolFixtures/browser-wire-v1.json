@@ -1,0 +1,13 @@
+{
+  "setBrowserControl": { "type": "set_browser_control", "enabled": true },
+  "browserActionRequest": {
+    "type": "browser_action_request", "request_id": "request-1",
+    "tool": "browser_read_page", "arguments": { "filter": "interactive" },
+    "timeout_ms": 60000, "session_id": "session-1",
+    "access": { "tab_id": "tab-1", "level": "read", "source": "user_share" }
+  },
+  "browserActionResult": {
+    "type": "browser_action_result", "request_id": "request-1",
+    "result": { "text": "Example — https://example.com" }
+  }
+}

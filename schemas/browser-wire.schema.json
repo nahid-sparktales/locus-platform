@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://locushost.co/schemas/browser-wire-v1.json",
+  "title": "Locus Browser Broker Protocol",
+  "oneOf": [
+    { "$ref": "#/$defs/setBrowserControl" },
+    { "$ref": "#/$defs/browserActionRequest" },
+    { "$ref": "#/$defs/browserActionResult" }
+  ],
+  "$defs": {
+    "setBrowserControl": {
+      "type": "object",
+      "required": ["type", "enabled"],
+      "properties": {
+        "type": { "const": "set_browser_control" },
+        "enabled": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "browserActionRequest": {
+      "type": "object",
+      "required": ["type", "request_id", "tool", "arguments", "timeout_ms", "session_id"],
+      "properties": {
+        "type": { "const": "browser_action_request" },
+        "request_id": { "type": "string", "minLength": 1 },
+        "tool": {
+          "enum": [
+            "browser_read_page", "browser_get_text", "browser_find",
+            "browser_navigate", "browser_tabs", "browser_input",
+            "browser_screenshot", "browser_wait_for", "browser_console",
+            "browser_network", "browser_resize", "browser_javascript",
+            "browser_dev_server"
+          ]
+        },
+        "arguments": { "type": "object" },
+        "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 180000 },
+        "session_id": { "type": "string", "minLength": 1 },
+        "access": {
+          "type": "object",
+          "properties": {
+            "tab_id": { "type": "string" },
+            "level": { "enum": ["read", "interact"] },
+            "source": { "enum": ["user_share", "agent_created"] }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "browserActionResult": {
+      "type": "object",
+      "required": ["type", "request_id", "result"],
+      "properties": {
+        "type": { "const": "browser_action_result" },
+        "request_id": { "type": "string", "minLength": 1 },
+        "result": {
+          "type": "object",
+          "properties": {
+            "text": { "type": "string" },
+            "error": { "type": "string" }
+          },
+          "anyOf": [
+            { "required": ["text"] },
+            { "required": ["error"] }
+          ],
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
