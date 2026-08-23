@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from ollama_code.codex_app_server import (
+    PINNED_CODEX_APP_SERVER_VERSION,
     CodexAppServerError,
     CodexAppServerManager,
     CodexManagerRegistry,
     CodexProtocolMismatch,
+    codex_app_server_component_manifest,
     codex_home_for_account,
     dynamic_tools,
 )
@@ -47,6 +51,23 @@ def test_dynamic_tools_reject_duplicates_and_invalid_names():
 def test_bundled_codex_command_uses_supported_app_server_flags():
     manager = CodexAppServerManager(helper_path="/fake/codex")
     assert manager._command() == ["/fake/codex", "app-server", "--listen", "stdio://"]
+
+
+def test_bundled_codex_component_is_fully_pinned_for_apple_silicon():
+    manifest = codex_app_server_component_manifest()
+    target = manifest["targets"]["darwin-arm64"]
+
+    assert manifest["schema_version"] == 1
+    assert manifest["version"] == PINNED_CODEX_APP_SERVER_VERSION
+    assert manifest["license"] == "Apache-2.0"
+    assert target["package"] == "@openai/codex"
+    assert target["package_version"] == f"{manifest['version']}-darwin-arm64"
+    assert target["archive_url"].startswith("https://registry.npmjs.org/@openai/codex/")
+    assert re.fullmatch(r"[0-9a-f]{64}", target["archive_sha256"])
+    assert re.fullmatch(r"[0-9a-f]{64}", target["executable_sha256"])
+    assert target["archive_size"] > 0
+    assert target["executable_size"] > 0
+    assert target["upstream_signing_team_id"] == "2DC432GLL2"
 
 
 def test_thread_contract_disables_native_environment_and_tools(monkeypatch):

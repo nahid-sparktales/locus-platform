@@ -22,7 +22,28 @@ from .paths import APP_DIR
 
 logger = logging.getLogger(__name__)
 
-PINNED_CODEX_APP_SERVER_VERSION = "0.147.0"
+_COMPONENT_MANIFEST_PATH = (
+    Path(__file__).with_name("runtime_components") / "codex-app-server.json"
+)
+
+
+def codex_app_server_component_manifest() -> dict[str, Any]:
+    """Return the release contract for the bundled OpenAI helper.
+
+    Keeping the artifact URL, hashes, architecture, license, and protocol
+    version beside the runtime makes the shared platform release the single
+    source of truth for every native client that embeds the helper.
+    """
+    try:
+        value = json.loads(_COMPONENT_MANIFEST_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("The Codex App Server component manifest is invalid") from error
+    if not isinstance(value, dict) or not isinstance(value.get("version"), str):
+        raise RuntimeError("The Codex App Server component manifest is invalid")
+    return value
+
+
+PINNED_CODEX_APP_SERVER_VERSION = str(codex_app_server_component_manifest()["version"])
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
