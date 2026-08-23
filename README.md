@@ -13,6 +13,10 @@ The native Swift Locus app and the Electron Locus Browser keep separate UI and
 browser-engine adapters. Both consume tagged releases from this repository and
 must pass the same protocol fixtures.
 
+The first browser release pins the immutable `v0.1.0-canary.1` tag. Platform
+tags run TypeScript, Swift, schema/fixture, Python, lint, and dependency-audit
+gates before they can be selected by the browser release environment.
+
 ## Development
 
 ```bash
