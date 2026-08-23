@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0-canary.1 — unreleased
+## 0.1.0-canary.2 — unreleased
 
 First shared canary contract for Locus Browser:
 
@@ -13,3 +13,6 @@ First shared canary contract for Locus Browser:
 Schema evolution is additive within this canary contract. Browser tool names and
 the `set_browser_control`, `browser_action_request`, and
 `browser_action_result` envelopes remain wire-compatible.
+
+`v0.1.0-canary.1` was superseded before distribution because its hosted CI
+image provided Swift 5.10 for a Swift 6 package.
