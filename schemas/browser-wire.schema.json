@@ -5,7 +5,8 @@
   "oneOf": [
     { "$ref": "#/$defs/setBrowserControl" },
     { "$ref": "#/$defs/browserActionRequest" },
-    { "$ref": "#/$defs/browserActionResult" }
+    { "$ref": "#/$defs/browserActionResult" },
+    { "$ref": "#/$defs/agentUserMessage" }
   ],
   "$defs": {
     "setBrowserControl": {
@@ -67,6 +68,134 @@
         }
       },
       "additionalProperties": false
+    },
+    "recordingTranscriptSegment": {
+      "type": "object",
+      "required": ["source", "start_ms", "end_ms", "text"],
+      "properties": {
+        "source": { "enum": ["tab", "microphone"] },
+        "start_ms": { "type": "integer", "minimum": 0 },
+        "end_ms": { "type": "integer", "minimum": 0 },
+        "text": { "type": "string", "minLength": 1, "maxLength": 4000 },
+        "tab_id": { "type": "string", "minLength": 1, "maxLength": 255 }
+      },
+      "additionalProperties": false
+    },
+    "speechSettings": {
+      "type": "object",
+      "required": ["engine", "language", "local_model_status"],
+      "properties": {
+        "engine": { "enum": ["local", "openai", "custom"] },
+        "language": { "type": "string", "minLength": 2, "maxLength": 16 },
+        "custom_base_url": { "type": "string", "maxLength": 2048 },
+        "custom_model": { "type": "string", "maxLength": 255 },
+        "local_model_status": { "enum": ["missing", "downloading", "ready", "error"] },
+        "local_model_progress": { "type": "number", "minimum": 0, "maximum": 1 },
+        "message": { "type": "string", "maxLength": 2000 }
+      },
+      "additionalProperties": false
+    },
+    "recordingSourceState": {
+      "type": "object",
+      "required": ["tab_audio", "microphone"],
+      "properties": {
+        "tab_audio": { "type": "boolean" },
+        "microphone": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "transcriptSegment": {
+      "type": "object",
+      "required": ["id", "recording_id", "source", "start_ms", "end_ms", "text"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "recording_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "source": { "enum": ["tab", "microphone"] },
+        "start_ms": { "type": "integer", "minimum": 0 },
+        "end_ms": { "type": "integer", "minimum": 0 },
+        "text": { "type": "string", "minLength": 1, "maxLength": 4000 },
+        "tab_id": { "type": "string", "minLength": 1, "maxLength": 255 }
+      },
+      "additionalProperties": false
+    },
+    "recordingTranscriptSummary": {
+      "type": "object",
+      "required": ["id", "work_session_id", "started_at", "duration_ms", "segment_count"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "work_session_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "started_at": { "type": "integer", "minimum": 0 },
+        "ended_at": { "type": "integer", "minimum": 0 },
+        "duration_ms": { "type": "integer", "minimum": 0 },
+        "segment_count": { "type": "integer", "minimum": 0 },
+        "video_path": { "type": "string", "maxLength": 8192 }
+      },
+      "additionalProperties": false
+    },
+    "recordingSessionState": {
+      "type": "object",
+      "required": ["status", "elapsed_ms", "sources", "save_video", "transcript_preview", "transcripts", "engine"],
+      "properties": {
+        "status": { "enum": ["idle", "starting", "recording", "paused", "stopping", "error"] },
+        "id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "started_at": { "type": "integer", "minimum": 0 },
+        "elapsed_ms": { "type": "integer", "minimum": 0 },
+        "sources": { "$ref": "#/$defs/recordingSourceState" },
+        "save_video": { "type": "boolean" },
+        "active_tab_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "paused_reason": { "type": "string", "maxLength": 512 },
+        "transcript_preview": { "type": "array", "maxItems": 20, "items": { "$ref": "#/$defs/transcriptSegment" } },
+        "transcripts": { "type": "array", "maxItems": 500, "items": { "$ref": "#/$defs/recordingTranscriptSummary" } },
+        "engine": { "enum": ["local", "openai", "custom"] },
+        "error": { "type": "string", "maxLength": 2000 }
+      },
+      "additionalProperties": false
+    },
+    "browserObservationFrame": {
+      "type": "object",
+      "required": ["captured_at", "mime_type", "data", "description"],
+      "properties": {
+        "captured_at": { "type": "string", "format": "date-time" },
+        "mime_type": { "enum": ["image/jpeg", "image/png", "image/webp"] },
+        "data": { "type": "string", "minLength": 1, "maxLength": 12000000 },
+        "description": { "type": "string", "minLength": 1, "maxLength": 512 }
+      },
+      "additionalProperties": false
+    },
+    "browserObservationContext": {
+      "type": "object",
+      "required": ["recording_id", "captured_at"],
+      "properties": {
+        "recording_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "captured_at": { "type": "string", "format": "date-time" },
+        "active_tab": {
+          "type": "object",
+          "required": ["id", "title", "url", "access_level"],
+          "properties": {
+            "id": { "type": "string", "minLength": 1, "maxLength": 255 },
+            "title": { "type": "string", "maxLength": 2048 },
+            "url": { "type": "string", "maxLength": 8192 },
+            "access_level": { "enum": ["read", "interact"] }
+          },
+          "additionalProperties": false
+        },
+        "transcript": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/recordingTranscriptSegment" } },
+        "page_text": { "type": "string", "maxLength": 12000 },
+        "frames": { "type": "array", "maxItems": 4, "items": { "$ref": "#/$defs/browserObservationFrame" } },
+        "paused_reason": { "type": "string", "maxLength": 512 }
+      },
+      "additionalProperties": false
+    },
+    "agentUserMessage": {
+      "type": "object",
+      "required": ["type", "text"],
+      "properties": {
+        "type": { "const": "user_message" },
+        "text": { "type": "string", "minLength": 1, "maxLength": 200000 },
+        "mode": { "enum": ["ask", "work", "plan", "build"] },
+        "browser_context": { "$ref": "#/$defs/browserObservationContext" }
+      },
+      "additionalProperties": true
     }
   }
 }

@@ -57,6 +57,25 @@ export const browserBridgeSource = String.raw`
     }[element.tagName] || element.tagName.toLowerCase());
   }
 
+  function safeText(maxChars) {
+    if (!document.body) return '';
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    const parts = [];
+    let length = 0;
+    for (let node = walker.nextNode(); node && length < maxChars; node = walker.nextNode()) {
+      const parent = node.parentElement;
+      if (!parent || parent.closest('script, style, noscript, template') || !isVisible(parent)) continue;
+      const field = parent.closest('input, textarea, [contenteditable="true"]');
+      if (field && isSensitive(field)) continue;
+      const value = (node.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!value) continue;
+      const bounded = value.slice(0, Math.max(0, maxChars - length));
+      parts.push(bounded);
+      length += bounded.length + 1;
+    }
+    return parts.join(' ').slice(0, maxChars);
+  }
+
   function snapshot(options = {}) {
     epoch += 1;
     refs.clear();
@@ -84,7 +103,7 @@ export const browserBridgeSource = String.raw`
       epoch,
       url: location.href,
       title: document.title,
-      text: (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, Number(options.maxChars || 20_000)),
+      text: safeText(Math.min(Number(options.maxChars || 20_000), 100_000)),
       elements,
     };
   }
@@ -127,6 +146,27 @@ export const browserBridgeSource = String.raw`
     return { ok: true, name: nameFor(element) };
   }
 
+  function protectedRects() {
+    const rects = [];
+    const candidates = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"], iframe, frame'));
+    for (const element of candidates) {
+      if (!element.matches('iframe, frame') && !isSensitive(element)) continue;
+      if (!isVisible(element)) continue;
+      const rect = element.getBoundingClientRect();
+      rects.push({
+        x: Math.max(0, rect.x),
+        y: Math.max(0, rect.y),
+        width: Math.max(0, Math.min(innerWidth, rect.right) - Math.max(0, rect.x)),
+        height: Math.max(0, Math.min(innerHeight, rect.bottom) - Math.max(0, rect.y)),
+      });
+    }
+    return {
+      url: location.href,
+      viewport: { width: innerWidth, height: innerHeight },
+      rects: rects.filter((rect) => rect.width > 0 && rect.height > 0).slice(0, 250),
+    };
+  }
+
   globalThis.__locusBrowserBridge = Object.freeze({
     snapshot,
     target,
@@ -141,12 +181,13 @@ export const browserBridgeSource = String.raw`
     hasSensitiveFields() {
       return Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]')).some(isSensitive);
     },
+    protectedRects,
     maskSensitive() {
       const token = 'mask-' + nextMask++;
       const covers = [];
-      const candidates = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"], iframe'));
+      const candidates = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"], iframe, frame'));
       for (const element of candidates) {
-        if (!(element instanceof HTMLIFrameElement) && !isSensitive(element)) continue;
+        if (!element.matches('iframe, frame') && !isSensitive(element)) continue;
         const rect = element.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) continue;
         const cover = document.createElement('div');
@@ -194,6 +235,7 @@ export const bridgeInvocation = {
     `globalThis.__locusBrowserBridge.sensitiveAt(${JSON.stringify(x)}, ${JSON.stringify(y)})`,
   focusedSensitive: () => "globalThis.__locusBrowserBridge.focusedSensitive()",
   hasSensitiveFields: () => "globalThis.__locusBrowserBridge.hasSensitiveFields()",
+  protectedRects: () => "globalThis.__locusBrowserBridge.protectedRects()",
   maskSensitive: () => "globalThis.__locusBrowserBridge.maskSensitive()",
   unmaskSensitive: (token: string) =>
     `globalThis.__locusBrowserBridge.unmaskSensitive(${JSON.stringify(token)})`,

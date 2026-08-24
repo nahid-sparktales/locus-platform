@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.0-canary.4 — 2026-08-23
+
+Adds the additive live browser observation and recording contracts used by
+Locus Browser: typed speech settings, recording/source state, encrypted
+transcript summaries, and a bounded optional `browser_context` on user and
+steering messages. The agent injects that context ephemerally as untrusted
+evidence and does not copy it into ordinary session history. The browser bridge
+now returns protected credential/payment and inaccessible-frame geometry, and
+the platform pins the checksummed Whisper runtime and multilingual model used
+for default on-device transcription.
+
 ## 0.1.0-canary.3 — 2026-08-23
 
 Adds the fully pinned Apple Silicon OpenAI Codex App Server component contract

@@ -7,7 +7,14 @@ describe("isolated browser bridge", () => {
     expect(browserBridgeSource).toContain("one-time-code");
     expect(browserBridgeSource).toContain("data-locus-protected-cover");
     expect(browserBridgeSource).toContain("focusedSensitive");
+    expect(browserBridgeSource).toContain("protectedRects");
+    expect(browserBridgeSource).toContain("safeText");
+    expect(browserBridgeSource).toContain("iframe, frame");
     expect(browserBridgeSource).not.toContain("ipcRenderer");
+  });
+
+  it("exposes a host-only protected rectangle invocation", () => {
+    expect(bridgeInvocation.protectedRects()).toBe("globalThis.__locusBrowserBridge.protectedRects()");
   });
 
   it("escapes invocation values as JSON", () => {
