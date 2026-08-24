@@ -43,6 +43,8 @@
     "browser.console-network-devices",
     "browser.dialogs-popups-download-quarantine",
     "browser.concurrent-session-isolation",
+    "browser.live-recording-context",
+    "browser.local-encrypted-transcripts",
     "computer-control.macos-direct",
     "mobile.companion-access",
     "network.proxy",

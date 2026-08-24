@@ -9,5 +9,32 @@
   "browserActionResult": {
     "type": "browser_action_result", "request_id": "request-1",
     "result": { "text": "Example — https://example.com" }
+  },
+  "speechSettings": {
+    "engine": "local", "language": "auto", "local_model_status": "ready"
+  },
+  "recordingSessionState": {
+    "status": "recording", "id": "recording-1", "started_at": 1787486400000,
+    "elapsed_ms": 1200, "sources": { "tab_audio": true, "microphone": true },
+    "save_video": false, "active_tab_id": "tab-1", "engine": "local",
+    "transcript_preview": [{
+      "id": "segment-1", "recording_id": "recording-1", "source": "microphone",
+      "start_ms": 0, "end_ms": 1200, "text": "Open the first result", "tab_id": "tab-1"
+    }],
+    "transcripts": []
+  },
+  "agentUserMessage": {
+    "type": "user_message", "text": "Help me with this", "mode": "work",
+    "browser_context": {
+      "recording_id": "recording-1", "captured_at": "2026-08-23T12:00:00.000Z",
+      "active_tab": {
+        "id": "tab-1", "title": "Example", "url": "https://example.com",
+        "access_level": "interact"
+      },
+      "transcript": [
+        { "source": "microphone", "start_ms": 0, "end_ms": 1200, "text": "Open the first result" }
+      ],
+      "page_text": "Example page"
+    }
   }
 }

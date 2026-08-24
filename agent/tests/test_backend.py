@@ -2697,7 +2697,7 @@ def test_websocket_ask_mode_routes_through_the_tool_free_turn_boundary(client, m
 
     assert captured == [(
         server_mod._run_user_turn,
-        (service, "/init", True, [], None, "ask"),
+        (service, "/init", True, [], None, "ask", None),
     )]
 
 
@@ -2808,6 +2808,81 @@ def test_websocket_agentic_modes_route_image_attachments(client, monkeypatch):
         assert call is server_mod._run_user_turn
         assert args[:3] == (service, "Fix the layout shown in this screenshot", False)
         assert args[3][0]["data"] == "cG5n"
+
+
+def test_websocket_routes_bounded_live_browser_context(client, monkeypatch):
+    service = client.app.state.service
+    captured = []
+    monkeypatch.setattr(service, "start_turn", lambda _loop, call, *args: captured.append((call, args)) or True)
+
+    asyncio.run(server_mod._handle_client_message(service, {
+        "type": "user_message",
+        "text": "Help me with this",
+        "mode": "work",
+        "browser_context": {
+            "recording_id": "recording-1",
+            "captured_at": "2026-08-23T12:00:00.000Z",
+            "active_tab": {
+                "id": "tab-1", "title": "Example", "url": "https://example.com",
+                "access_level": "interact",
+            },
+            "transcript": [{
+                "source": "microphone", "start_ms": 0, "end_ms": 1200,
+                "text": "Open the first result",
+            }],
+            "page_text": "Example page",
+        },
+    }))
+
+    call, args = captured[0]
+    assert call is server_mod._run_user_turn
+    assert args[6]["recording_id"] == "recording-1"
+    assert "Open the first result" in server_mod._browser_context_prompt(args[6])
+    assert "UNTRUSTED EVIDENCE" in server_mod._browser_context_prompt(args[6])
+
+
+def test_live_browser_context_rejects_invalid_access_and_oversized_transcript():
+    with pytest.raises(ValueError, match="access"):
+        server_mod._validated_browser_context({
+            "recording_id": "recording-1", "captured_at": "now",
+            "active_tab": {"id": "tab-1", "access_level": "admin"},
+        })
+    with pytest.raises(ValueError, match="too large"):
+        server_mod._validated_browser_context({
+            "recording_id": "recording-1", "captured_at": "now",
+            "transcript": [{
+                "source": "tab", "start_ms": index, "end_ms": index + 1,
+                "text": "x" * 4_000,
+            } for index in range(7)],
+        })
+
+
+def test_busy_turn_steering_receives_fresh_untrusted_browser_context(client, monkeypatch):
+    from concurrent.futures import Future
+
+    service = client.app.state.service
+    captured = []
+    service.turn_future = Future()
+    monkeypatch.setattr(service.core, "steer", lambda text: captured.append(text) or "queued")
+
+    asyncio.run(server_mod._handle_client_message(service, {
+        "type": "steer",
+        "text": "Help me now",
+        "browser_context": {
+            "recording_id": "recording-steer",
+            "captured_at": "2026-08-23T12:00:00.000Z",
+            "transcript": [{
+                "source": "tab", "start_ms": 10, "end_ms": 20,
+                "text": "The page says continue",
+            }],
+        },
+    }))
+
+    assert "Help me now" in captured[0]
+    assert "UNTRUSTED EVIDENCE" in captured[0]
+    assert "The page says continue" in captured[0]
+    service.turn_future.cancel()
+    service.turn_future = None
 
 
 def test_team_turns_route_attachments_to_the_team_runner(client, monkeypatch):

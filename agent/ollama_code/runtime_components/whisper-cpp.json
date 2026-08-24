@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "component": "whisper.cpp",
+  "version": "1.7.6",
+  "source_url": "https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.7.6.tar.gz",
+  "source_sha256": "166140e9a6d8a36f787a2bd77f8f44dd64874f12dd8359ff7c1f4f9acb86202e",
+  "license": "MIT",
+  "models": [
+    {
+      "id": "base-q5_1",
+      "name": "Whisper Base Multilingual",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin",
+      "sha256": "422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898",
+      "size": 59707625,
+      "file": "ggml-base-q5_1.bin"
+    }
+  ]
+}
