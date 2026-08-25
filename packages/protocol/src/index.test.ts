@@ -4,9 +4,12 @@ import {
   BrowserActionResultSchema,
   AgentUserMessageSchema,
   RecordingSessionStateSchema,
+  ResearchBoardRequestSchema,
+  ResearchBoardResultSchema,
   SpeechSettingsSchema,
   TabAccessGrantSchema,
   browserToolNames,
+  validateResearchArtifactCitations,
 } from "./index.js";
 
 describe("browser protocol", () => {
@@ -89,5 +92,41 @@ describe("browser protocol", () => {
       }],
       transcripts: [], engine: "local",
     }).transcript_preview).toHaveLength(1);
+  });
+
+  it("validates bounded research sources and exact citations", () => {
+    const source = {
+      source_id: "source-1", tab_id: "tab-1", title: "Example",
+      url: "https://example.com/article", captured_at: "2026-08-24T12:00:00.000Z",
+      content_hash: "a".repeat(64), passages: [{ passage_id: "p1", text: "The measured result was 42." }],
+    };
+    const request = ResearchBoardRequestSchema.parse({
+      type: "research_board_request", request_id: "research-1", prompt: "Compare the evidence",
+      format: "comparison", sources: [source],
+    });
+    const result = ResearchBoardResultSchema.parse({
+      type: "research_board_result", request_id: "research-1",
+      artifact: { title: "Comparison", summary: "A cited summary.", sections: [{
+        heading: "Findings", claims: [{ text: "The result was 42.", citations: [{ source_id: "source-1", passage_id: "p1" }] }],
+      }] },
+    });
+    expect(validateResearchArtifactCitations(result.artifact, request.sources)).toBe(true);
+    expect(validateResearchArtifactCitations({
+      ...result.artifact,
+      sections: [{ heading: "Findings", claims: [{ text: "Unsupported", citations: [{ source_id: "source-1", passage_id: "missing" }] }] }],
+    }, request.sources)).toBe(false);
+  });
+
+  it("rejects oversized research evidence", () => {
+    expect(() => ResearchBoardRequestSchema.parse({
+      type: "research_board_request", request_id: "research-1", prompt: "Compare", format: "brief",
+      sources: Array.from({ length: 10 }, (_, sourceIndex) => ({
+        source_id: `source-${sourceIndex}`, tab_id: `tab-${sourceIndex}`, title: "Example",
+        url: `https://example.com/${sourceIndex}`, captured_at: "2026-08-24T12:00:00.000Z",
+        content_hash: "b".repeat(64), passages: Array.from({ length: 2 }, (_, passageIndex) => ({
+          passage_id: `p${passageIndex}`, text: "x".repeat(7_000),
+        })),
+      })),
+    })).toThrow(/120,000/);
   });
 });

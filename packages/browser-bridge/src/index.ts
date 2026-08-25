@@ -76,6 +76,114 @@ export const browserBridgeSource = String.raw`
     return parts.join(' ').slice(0, maxChars);
   }
 
+  function strictText(maxChars) {
+    if (!document.body) return '';
+    const excluded = [
+      'script', 'style', 'noscript', 'template', 'form', 'input', 'textarea',
+      'select', 'option', '[contenteditable]', 'iframe', 'frame',
+      '[data-locus-private]', '[aria-hidden="true"]',
+    ].join(',');
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    const parts = [];
+    let length = 0;
+    for (let node = walker.nextNode(); node && length < maxChars; node = walker.nextNode()) {
+      const parent = node.parentElement;
+      if (!parent || parent.closest(excluded) || !isVisible(parent) || isSensitive(parent)) continue;
+      const value = (node.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!value) continue;
+      const bounded = value.slice(0, Math.max(0, maxChars - length));
+      parts.push(bounded);
+      length += bounded.length + 1;
+    }
+    return parts.join('\n').slice(0, maxChars);
+  }
+
+  function strictSnapshot(options = {}) {
+    const maxChars = Math.min(Math.max(Number(options.maxChars || 60_000), 1), 100_000);
+    return {
+      url: location.href,
+      title: document.title,
+      lang: document.documentElement.lang || '',
+      capturedAt: new Date().toISOString(),
+      text: strictText(maxChars),
+    };
+  }
+
+  function readerArticle(options = {}) {
+    if (!document.body) return { available: false, reason: 'This page has no readable document body.' };
+    const candidates = Array.from(document.querySelectorAll('article, main, [role="main"], .article, .post, .entry-content'));
+    candidates.push(document.body);
+    let best = null;
+    let bestScore = 0;
+    for (const candidate of candidates) {
+      if (!(candidate instanceof Element) || !isVisible(candidate)) continue;
+      const text = (candidate.innerText || '').replace(/\s+/g, ' ').trim();
+      const paragraphs = candidate.querySelectorAll('p').length;
+      const links = candidate.querySelectorAll('a').length;
+      const score = Math.min(text.length, 100_000) + paragraphs * 180 - links * 18;
+      if (text.length >= 350 && score > bestScore) { best = candidate; bestScore = score; }
+    }
+    if (!best) return { available: false, reason: 'Locus could not reliably extract an article from this page.' };
+    const clone = best.cloneNode(true);
+    if (!(clone instanceof Element)) return { available: false, reason: 'Article extraction failed.' };
+    for (const element of clone.querySelectorAll('script, style, noscript, template, form, input, textarea, select, button, iframe, frame, nav, aside, footer, [contenteditable], [aria-hidden="true"]')) element.remove();
+    for (const element of clone.querySelectorAll('*')) {
+      for (const attribute of Array.from(element.attributes)) {
+        if (/^on/i.test(attribute.name) || attribute.name === 'srcdoc' || attribute.name === 'style') element.removeAttribute(attribute.name);
+      }
+      if (element instanceof HTMLAnchorElement) {
+        try { element.href = new URL(element.getAttribute('href') || '', location.href).href; } catch { element.removeAttribute('href'); }
+      }
+      if (element instanceof HTMLImageElement) {
+        try { element.src = new URL(element.getAttribute('src') || '', location.href).href; } catch { element.remove(); }
+        element.removeAttribute('srcset');
+      }
+    }
+    const text = (clone.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 100_000);
+    if (text.length < 350) return { available: false, reason: 'This page does not contain enough article text.' };
+    const maxHtmlChars = Math.min(Math.max(Number(options.maxHtmlChars || 250_000), 1), 300_000);
+    return {
+      available: true,
+      url: location.href,
+      title: document.title,
+      byline: document.querySelector('[rel="author"], .byline, [itemprop="author"]')?.textContent?.replace(/\s+/g, ' ').trim().slice(0, 500) || '',
+      lang: document.documentElement.lang || '',
+      text,
+      html: clone.innerHTML.slice(0, maxHtmlChars),
+    };
+  }
+
+  function readerDocument(options = {}) {
+    if (!document.documentElement || !document.body) return { available: false, reason: 'This page has no readable document body.' };
+    const clone = document.documentElement.cloneNode(true);
+    if (!(clone instanceof Element)) return { available: false, reason: 'Article extraction failed.' };
+    const sources = [document.documentElement, ...document.documentElement.querySelectorAll('*')];
+    const copies = [clone, ...clone.querySelectorAll('*')];
+    const excluded = 'script,style,noscript,template,form,input,textarea,select,option,button,iframe,frame,nav,[contenteditable],[aria-hidden="true"],[data-locus-private]';
+    for (let index = 0; index < Math.min(sources.length, copies.length); index += 1) {
+      const source = sources[index];
+      const copy = copies[index];
+      if (!source || !copy) continue;
+      if (source.matches(excluded) || isSensitive(source) || (!source.matches('html,body') && !isVisible(source))) {
+        copy.remove();
+        continue;
+      }
+      for (const attribute of Array.from(copy.attributes)) {
+        if (/^on/i.test(attribute.name) || ['srcdoc', 'style', 'value', 'placeholder', 'name', 'autocomplete'].includes(attribute.name)) copy.removeAttribute(attribute.name);
+      }
+    }
+    const maxHtmlChars = Math.min(Math.max(Number(options.maxHtmlChars || 300_000), 1), 400_000);
+    const html = '<!doctype html>' + clone.outerHTML;
+    if (html.length < 500) return { available: false, reason: 'This page does not contain enough readable markup.' };
+    return {
+      available: true,
+      url: location.href,
+      title: document.title,
+      lang: document.documentElement.lang || '',
+      html: html.slice(0, maxHtmlChars),
+    };
+  }
+
   function snapshot(options = {}) {
     epoch += 1;
     refs.clear();
@@ -169,6 +277,9 @@ export const browserBridgeSource = String.raw`
 
   globalThis.__locusBrowserBridge = Object.freeze({
     snapshot,
+    strictSnapshot,
+    readerArticle,
+    readerDocument,
     target,
     setValue,
     sensitiveAt(x, y) {
@@ -225,6 +336,12 @@ export const browserBridgeSource = String.raw`
 export const bridgeInvocation = {
   snapshot: (options: Record<string, unknown> = {}) =>
     `globalThis.__locusBrowserBridge.snapshot(${JSON.stringify(options)})`,
+  strictSnapshot: (options: Record<string, unknown> = {}) =>
+    `globalThis.__locusBrowserBridge.strictSnapshot(${JSON.stringify(options)})`,
+  readerArticle: (options: Record<string, unknown> = {}) =>
+    `globalThis.__locusBrowserBridge.readerArticle(${JSON.stringify(options)})`,
+  readerDocument: (options: Record<string, unknown> = {}) =>
+    `globalThis.__locusBrowserBridge.readerDocument(${JSON.stringify(options)})`,
   target: (ref: string) =>
     `globalThis.__locusBrowserBridge.target(${JSON.stringify(ref)})`,
   setValue: (ref: string, value: string) =>

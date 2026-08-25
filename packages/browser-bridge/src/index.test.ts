@@ -9,12 +9,22 @@ describe("isolated browser bridge", () => {
     expect(browserBridgeSource).toContain("focusedSensitive");
     expect(browserBridgeSource).toContain("protectedRects");
     expect(browserBridgeSource).toContain("safeText");
+    expect(browserBridgeSource).toContain("strictSnapshot");
+    expect(browserBridgeSource).toContain("readerArticle");
+    expect(browserBridgeSource).toContain("readerDocument");
+    expect(browserBridgeSource).toContain("[contenteditable]");
     expect(browserBridgeSource).toContain("iframe, frame");
     expect(browserBridgeSource).not.toContain("ipcRenderer");
   });
 
   it("exposes a host-only protected rectangle invocation", () => {
     expect(bridgeInvocation.protectedRects()).toBe("globalThis.__locusBrowserBridge.protectedRects()");
+  });
+
+  it("exposes host-only strict recall and reader invocations", () => {
+    expect(bridgeInvocation.strictSnapshot({ maxChars: 1_000 })).toContain("strictSnapshot");
+    expect(bridgeInvocation.readerArticle()).toBe("globalThis.__locusBrowserBridge.readerArticle({})");
+    expect(bridgeInvocation.readerDocument({ maxHtmlChars: 3_000 })).toContain("readerDocument");
   });
 
   it("escapes invocation values as JSON", () => {

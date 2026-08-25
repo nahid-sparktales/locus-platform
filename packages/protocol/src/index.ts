@@ -178,6 +178,89 @@ export const BrowserObservationContextSchema = z.object({
 });
 export type BrowserObservationContext = z.infer<typeof BrowserObservationContextSchema>;
 
+export const ResearchPassageSchema = z.object({
+  passage_id: z.string().min(1).max(255),
+  text: z.string().trim().min(1).max(12_000),
+});
+export type ResearchPassage = z.infer<typeof ResearchPassageSchema>;
+
+export const ResearchSourceSchema = z.object({
+  source_id: z.string().min(1).max(255),
+  tab_id: z.string().min(1).max(255),
+  title: z.string().max(2_048),
+  url: z.string().url().max(8_192),
+  captured_at: z.string().datetime(),
+  content_hash: z.string().regex(/^[a-f0-9]{64}$/),
+  passages: z.array(ResearchPassageSchema).min(1).max(80),
+});
+export type ResearchSource = z.infer<typeof ResearchSourceSchema>;
+
+export const ResearchCitationSchema = z.object({
+  source_id: z.string().min(1).max(255),
+  passage_id: z.string().min(1).max(255),
+});
+export type ResearchCitation = z.infer<typeof ResearchCitationSchema>;
+
+export const ResearchClaimSchema = z.object({
+  text: z.string().trim().min(1).max(8_000),
+  citations: z.array(ResearchCitationSchema).min(1).max(12),
+});
+export type ResearchClaim = z.infer<typeof ResearchClaimSchema>;
+
+export const ResearchSectionSchema = z.object({
+  heading: z.string().trim().min(1).max(500),
+  claims: z.array(ResearchClaimSchema).min(1).max(50),
+});
+
+export const ResearchArtifactSchema = z.object({
+  title: z.string().trim().min(1).max(500),
+  summary: z.string().trim().min(1).max(12_000),
+  sections: z.array(ResearchSectionSchema).min(1).max(30),
+});
+export type ResearchArtifact = z.infer<typeof ResearchArtifactSchema>;
+
+export const ResearchBoardRequestSchema = z.object({
+  type: z.literal("research_board_request"),
+  request_id: z.string().min(1).max(255),
+  prompt: z.string().trim().min(1).max(20_000),
+  format: z.enum(["comparison", "brief", "evidence"]),
+  sources: z.array(ResearchSourceSchema).min(1).max(10),
+}).superRefine((request, issue) => {
+  const sourceIds = new Set<string>();
+  let characters = 0;
+  for (const source of request.sources) {
+    if (sourceIds.has(source.source_id)) issue.addIssue({ code: "custom", message: `Duplicate source id ${source.source_id}` });
+    sourceIds.add(source.source_id);
+    const passageIds = new Set<string>();
+    for (const passage of source.passages) {
+      characters += passage.text.length;
+      if (passageIds.has(passage.passage_id)) issue.addIssue({ code: "custom", message: `Duplicate passage id ${passage.passage_id}` });
+      passageIds.add(passage.passage_id);
+    }
+  }
+  if (characters > 120_000) issue.addIssue({ code: "custom", message: "Research source context exceeds 120,000 characters" });
+});
+export type ResearchBoardRequest = z.infer<typeof ResearchBoardRequestSchema>;
+
+export const ResearchBoardProgressSchema = z.object({
+  type: z.literal("research_board_progress"),
+  request_id: z.string().min(1).max(255),
+  message: z.string().min(1).max(1_000),
+});
+
+export const ResearchBoardResultSchema = z.object({
+  type: z.literal("research_board_result"),
+  request_id: z.string().min(1).max(255),
+  artifact: ResearchArtifactSchema,
+});
+export type ResearchBoardResult = z.infer<typeof ResearchBoardResultSchema>;
+
+export const ResearchBoardErrorSchema = z.object({
+  type: z.literal("research_board_error"),
+  request_id: z.string().min(1).max(255),
+  error: z.string().min(1).max(4_000),
+});
+
 export const AgentUserMessageSchema = z.object({
   type: z.literal("user_message"),
   text: z.string().trim().min(1).max(200_000),
@@ -209,6 +292,24 @@ export const ClientAgentMessageSchema = z.discriminatedUnion("type", [
   SetBrowserControlSchema,
   BrowserActionResultSchema,
   AgentUserMessageSchema,
+  ResearchBoardRequestSchema,
 ]);
 
 export type ClientAgentMessage = z.infer<typeof ClientAgentMessageSchema>;
+
+export const ResearchBoardEventSchema = z.discriminatedUnion("type", [
+  ResearchBoardProgressSchema,
+  ResearchBoardResultSchema,
+  ResearchBoardErrorSchema,
+]);
+export type ResearchBoardEvent = z.infer<typeof ResearchBoardEventSchema>;
+
+export function validateResearchArtifactCitations(
+  artifact: ResearchArtifact,
+  sources: readonly ResearchSource[],
+): boolean {
+  const passages = new Set(sources.flatMap((source) => source.passages.map((passage) => `${source.source_id}:${passage.passage_id}`)));
+  return artifact.sections.every((section) => section.claims.every((claim) =>
+    claim.citations.length > 0 && claim.citations.every((citation) => passages.has(`${citation.source_id}:${citation.passage_id}`)),
+  ));
+}
