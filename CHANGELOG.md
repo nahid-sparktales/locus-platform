@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.0-canary.5 — 2026-08-24
+
+Adds the private browser-intelligence contracts: a signed macOS semantic helper
+backed by Apple Natural Language with a deterministic keyword fallback, strict
+editable-field-free page snapshots, reader article extraction, and typed cited
+research-board requests and results. Research runs are read-only, non-persisted,
+bounded to explicitly supplied evidence, and reject missing or invented passage
+citations before results reach the browser.
+
 ## 0.1.0-canary.4 — 2026-08-23
 
 Adds the additive live browser observation and recording contracts used by

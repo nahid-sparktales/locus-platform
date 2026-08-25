@@ -6,7 +6,11 @@
     { "$ref": "#/$defs/setBrowserControl" },
     { "$ref": "#/$defs/browserActionRequest" },
     { "$ref": "#/$defs/browserActionResult" },
-    { "$ref": "#/$defs/agentUserMessage" }
+    { "$ref": "#/$defs/agentUserMessage" },
+    { "$ref": "#/$defs/researchBoardRequest" },
+    { "$ref": "#/$defs/researchBoardProgress" },
+    { "$ref": "#/$defs/researchBoardResult" },
+    { "$ref": "#/$defs/researchBoardError" }
   ],
   "$defs": {
     "setBrowserControl": {
@@ -196,6 +200,108 @@
         "browser_context": { "$ref": "#/$defs/browserObservationContext" }
       },
       "additionalProperties": true
+    },
+    "researchPassage": {
+      "type": "object",
+      "required": ["passage_id", "text"],
+      "properties": {
+        "passage_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "text": { "type": "string", "minLength": 1, "maxLength": 12000 }
+      },
+      "additionalProperties": false
+    },
+    "researchSource": {
+      "type": "object",
+      "required": ["source_id", "tab_id", "title", "url", "captured_at", "content_hash", "passages"],
+      "properties": {
+        "source_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "tab_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "title": { "type": "string", "maxLength": 2048 },
+        "url": { "type": "string", "format": "uri", "maxLength": 8192 },
+        "captured_at": { "type": "string", "format": "date-time" },
+        "content_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "passages": { "type": "array", "minItems": 1, "maxItems": 80, "items": { "$ref": "#/$defs/researchPassage" } }
+      },
+      "additionalProperties": false
+    },
+    "researchCitation": {
+      "type": "object",
+      "required": ["source_id", "passage_id"],
+      "properties": {
+        "source_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "passage_id": { "type": "string", "minLength": 1, "maxLength": 255 }
+      },
+      "additionalProperties": false
+    },
+    "researchClaim": {
+      "type": "object",
+      "required": ["text", "citations"],
+      "properties": {
+        "text": { "type": "string", "minLength": 1, "maxLength": 8000 },
+        "citations": { "type": "array", "minItems": 1, "maxItems": 12, "items": { "$ref": "#/$defs/researchCitation" } }
+      },
+      "additionalProperties": false
+    },
+    "researchSection": {
+      "type": "object",
+      "required": ["heading", "claims"],
+      "properties": {
+        "heading": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "claims": { "type": "array", "minItems": 1, "maxItems": 50, "items": { "$ref": "#/$defs/researchClaim" } }
+      },
+      "additionalProperties": false
+    },
+    "researchArtifact": {
+      "type": "object",
+      "required": ["title", "summary", "sections"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 12000 },
+        "sections": { "type": "array", "minItems": 1, "maxItems": 30, "items": { "$ref": "#/$defs/researchSection" } }
+      },
+      "additionalProperties": false
+    },
+    "researchBoardRequest": {
+      "type": "object",
+      "required": ["type", "request_id", "prompt", "format", "sources"],
+      "properties": {
+        "type": { "const": "research_board_request" },
+        "request_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "prompt": { "type": "string", "minLength": 1, "maxLength": 20000 },
+        "format": { "enum": ["comparison", "brief", "evidence"] },
+        "sources": { "type": "array", "minItems": 1, "maxItems": 10, "items": { "$ref": "#/$defs/researchSource" } }
+      },
+      "additionalProperties": false
+    },
+    "researchBoardProgress": {
+      "type": "object",
+      "required": ["type", "request_id", "message"],
+      "properties": {
+        "type": { "const": "research_board_progress" },
+        "request_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "message": { "type": "string", "minLength": 1, "maxLength": 1000 }
+      },
+      "additionalProperties": false
+    },
+    "researchBoardResult": {
+      "type": "object",
+      "required": ["type", "request_id", "artifact"],
+      "properties": {
+        "type": { "const": "research_board_result" },
+        "request_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "artifact": { "$ref": "#/$defs/researchArtifact" }
+      },
+      "additionalProperties": false
+    },
+    "researchBoardError": {
+      "type": "object",
+      "required": ["type", "request_id", "error"],
+      "properties": {
+        "type": { "const": "research_board_error" },
+        "request_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "error": { "type": "string", "minLength": 1, "maxLength": 4000 }
+      },
+      "additionalProperties": false
     }
   }
 }

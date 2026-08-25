@@ -55,3 +55,27 @@ import Testing
     #expect(object["elapsed_ms"] as? Int == 2_000)
     #expect((object["sources"] as? [String: Any])?["tab_audio"] as? Bool == true)
 }
+
+@Test func researchBoardUsesExactSourcePassageCitations() throws {
+    let source = ResearchSource(
+        sourceId: "source-1", tabId: "tab-1", title: "Example",
+        url: "https://example.com/article", capturedAt: "2026-08-24T12:00:00.000Z",
+        contentHash: String(repeating: "a", count: 64),
+        passages: [ResearchPassage(passageId: "p1", text: "The measured result was 42.")]
+    )
+    let artifact = ResearchArtifact(
+        title: "Comparison", summary: "A cited summary.",
+        sections: [ResearchSection(
+            heading: "Findings",
+            claims: [ResearchClaim(
+                text: "The result was 42.",
+                citations: [ResearchCitation(sourceId: "source-1", passageId: "p1")]
+            )]
+        )]
+    )
+    #expect(artifact.citationsAreValid(for: [source]))
+    let request = ResearchBoardRequest(requestId: "research-1", prompt: "Compare", format: .comparison, sources: [source])
+    let object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any])
+    #expect(object["request_id"] as? String == "research-1")
+    #expect(((object["sources"] as? [[String: Any]])?.first)?["source_id"] as? String == "source-1")
+}

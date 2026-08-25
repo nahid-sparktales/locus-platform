@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
   title: Locus Local Agent Protocol
-  version: 1.0.0
-  description: Versioned local-only health and WebSocket bootstrap surface. Browser actions use browser-wire.schema.json.
+  version: 1.1.0
+  description: Versioned local-only health and WebSocket bootstrap surface. Browser actions and cited research-board messages use browser-wire.schema.json.
 servers:
   - url: http://127.0.0.1:{port}
     variables:

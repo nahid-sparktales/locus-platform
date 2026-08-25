@@ -101,6 +101,7 @@ from .sessions import (
     update_session_metadata,
 )
 from .solo_swarm import SoloSwarmError, SoloSwarmExecutor, snapshot_route
+from .research import run_research_board
 from .telemetry import TelemetryError, send_otlp, traceparent_for_run
 from .tools import truncate_output
 from .transcript_search import TranscriptIndex, TranscriptSearchError
@@ -6466,11 +6467,111 @@ def _browser_context_prompt(context: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _validated_research_board_request(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("The research request is malformed.")
+    request_id = str(value.get("request_id") or "").strip()
+    prompt = str(value.get("prompt") or "").strip()
+    board_format = str(value.get("format") or "")
+    if not request_id or len(request_id) > 255 or not prompt or len(prompt) > 20_000:
+        raise ValueError("The research request identity or prompt is invalid.")
+    if board_format not in {"comparison", "brief", "evidence"}:
+        raise ValueError("The research format is invalid.")
+    raw_sources = value.get("sources")
+    if not isinstance(raw_sources, list) or not 1 <= len(raw_sources) <= 10:
+        raise ValueError("Research requires between one and ten shared sources.")
+    source_ids: set[str] = set()
+    total_characters = 0
+    sources: list[dict[str, Any]] = []
+    for raw_source in raw_sources:
+        if not isinstance(raw_source, dict):
+            raise ValueError("A research source is malformed.")
+        source_id = str(raw_source.get("source_id") or "").strip()
+        tab_id = str(raw_source.get("tab_id") or "").strip()
+        url = str(raw_source.get("url") or "").strip()
+        captured_at = str(raw_source.get("captured_at") or "").strip()
+        content_hash = str(raw_source.get("content_hash") or "").strip().lower()
+        if (
+            not source_id or len(source_id) > 255 or source_id in source_ids
+            or not tab_id or len(tab_id) > 255
+            or not url.startswith(("https://", "http://")) or len(url) > 8_192
+            or not captured_at or not re.fullmatch(r"[a-f0-9]{64}", content_hash)
+        ):
+            raise ValueError("A research source identity is invalid.")
+        source_ids.add(source_id)
+        raw_passages = raw_source.get("passages")
+        if not isinstance(raw_passages, list) or not 1 <= len(raw_passages) <= 80:
+            raise ValueError("A research source has no bounded passages.")
+        passage_ids: set[str] = set()
+        passages: list[dict[str, str]] = []
+        for raw_passage in raw_passages:
+            if not isinstance(raw_passage, dict):
+                raise ValueError("A research passage is malformed.")
+            passage_id = str(raw_passage.get("passage_id") or "").strip()
+            text = str(raw_passage.get("text") or "").strip()
+            if (
+                not passage_id or len(passage_id) > 255 or passage_id in passage_ids
+                or not text or len(text) > 12_000
+            ):
+                raise ValueError("A research passage is invalid.")
+            passage_ids.add(passage_id)
+            total_characters += len(text)
+            if total_characters > 120_000:
+                raise ValueError("Research source context exceeds 120,000 characters.")
+            passages.append({"passage_id": passage_id, "text": text})
+        sources.append({
+            "source_id": source_id,
+            "tab_id": tab_id,
+            "title": str(raw_source.get("title") or "")[:2_048],
+            "url": url,
+            "captured_at": captured_at[:64],
+            "content_hash": content_hash,
+            "passages": passages,
+        })
+    return {
+        "request_id": request_id,
+        "prompt": prompt,
+        "format": board_format,
+        "sources": sources,
+    }
+
+
+def _run_research_request(svc: ChatService, request: dict[str, Any]) -> None:
+    svc.core._interrupt.clear()
+    svc.core.begin_steerable_turn()
+    try:
+        run_research_board(
+            svc.core,
+            svc.codex,
+            request,
+            emit=svc.emit,
+            should_stop=svc.core._should_stop_stream,
+        )
+    finally:
+        svc.core.end_steerable_turn()
+
+
 async def _handle_client_message(svc: ChatService, msg: dict[str, Any]) -> None:
     mtype = msg.get("type")
     core = svc.core
     loop = asyncio.get_running_loop()
-    if mtype == "user_message":
+    if mtype == "research_board_request":
+        try:
+            request = _validated_research_board_request(msg)
+        except ValueError as exc:
+            svc.queue_event({
+                "type": "research_board_error",
+                "request_id": str(msg.get("request_id") or "unknown")[:255],
+                "error": str(exc),
+            })
+            return
+        if not svc.start_turn(loop, _run_research_request, svc, request):
+            svc.queue_event({
+                "type": "research_board_error",
+                "request_id": request["request_id"],
+                "error": "Agent is busy — stop the current run first.",
+            })
+    elif mtype == "user_message":
         text = str(msg.get("text", "")).strip()
         if not text:
             return

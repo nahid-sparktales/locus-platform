@@ -318,3 +318,129 @@ public struct AgentUserMessage: Codable, Equatable, Sendable {
         case browserContext = "browser_context"
     }
 }
+
+public struct ResearchPassage: Codable, Equatable, Sendable {
+    public let passageId: String
+    public let text: String
+
+    public init(passageId: String, text: String) {
+        self.passageId = passageId; self.text = text
+    }
+
+    private enum CodingKeys: String, CodingKey { case passageId = "passage_id"; case text }
+}
+
+public struct ResearchSource: Codable, Equatable, Sendable {
+    public let sourceId: String
+    public let tabId: String
+    public let title: String
+    public let url: String
+    public let capturedAt: String
+    public let contentHash: String
+    public let passages: [ResearchPassage]
+
+    public init(sourceId: String, tabId: String, title: String, url: String, capturedAt: String, contentHash: String, passages: [ResearchPassage]) {
+        self.sourceId = sourceId; self.tabId = tabId; self.title = title; self.url = url
+        self.capturedAt = capturedAt; self.contentHash = contentHash; self.passages = passages
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case title, url, passages
+        case sourceId = "source_id"; case tabId = "tab_id"
+        case capturedAt = "captured_at"; case contentHash = "content_hash"
+    }
+}
+
+public struct ResearchCitation: Codable, Equatable, Hashable, Sendable {
+    public let sourceId: String
+    public let passageId: String
+
+    public init(sourceId: String, passageId: String) {
+        self.sourceId = sourceId; self.passageId = passageId
+    }
+
+    private enum CodingKeys: String, CodingKey { case sourceId = "source_id"; case passageId = "passage_id" }
+}
+
+public struct ResearchClaim: Codable, Equatable, Sendable {
+    public let text: String
+    public let citations: [ResearchCitation]
+    public init(text: String, citations: [ResearchCitation]) { self.text = text; self.citations = citations }
+}
+
+public struct ResearchSection: Codable, Equatable, Sendable {
+    public let heading: String
+    public let claims: [ResearchClaim]
+    public init(heading: String, claims: [ResearchClaim]) { self.heading = heading; self.claims = claims }
+}
+
+public struct ResearchArtifact: Codable, Equatable, Sendable {
+    public let title: String
+    public let summary: String
+    public let sections: [ResearchSection]
+    public init(title: String, summary: String, sections: [ResearchSection]) {
+        self.title = title; self.summary = summary; self.sections = sections
+    }
+
+    public func citationsAreValid(for sources: [ResearchSource]) -> Bool {
+        let known = Set(sources.flatMap { source in
+            source.passages.map { "\(source.sourceId):\($0.passageId)" }
+        })
+        return sections.allSatisfy { section in
+            section.claims.allSatisfy { claim in
+                !claim.citations.isEmpty && claim.citations.allSatisfy {
+                    known.contains("\($0.sourceId):\($0.passageId)")
+                }
+            }
+        }
+    }
+}
+
+public enum ResearchBoardFormat: String, Codable, Sendable { case comparison, brief, evidence }
+
+public struct ResearchBoardRequest: Codable, Equatable, Sendable {
+    public let type: String
+    public let requestId: String
+    public let prompt: String
+    public let format: ResearchBoardFormat
+    public let sources: [ResearchSource]
+
+    public init(requestId: String, prompt: String, format: ResearchBoardFormat, sources: [ResearchSource]) {
+        self.type = "research_board_request"; self.requestId = requestId
+        self.prompt = prompt; self.format = format; self.sources = sources
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case type, prompt, format, sources; case requestId = "request_id"
+    }
+}
+
+public struct ResearchBoardProgress: Codable, Equatable, Sendable {
+    public let type: String
+    public let requestId: String
+    public let message: String
+    public init(requestId: String, message: String) {
+        self.type = "research_board_progress"; self.requestId = requestId; self.message = message
+    }
+    private enum CodingKeys: String, CodingKey { case type, message; case requestId = "request_id" }
+}
+
+public struct ResearchBoardResult: Codable, Equatable, Sendable {
+    public let type: String
+    public let requestId: String
+    public let artifact: ResearchArtifact
+    public init(requestId: String, artifact: ResearchArtifact) {
+        self.type = "research_board_result"; self.requestId = requestId; self.artifact = artifact
+    }
+    private enum CodingKeys: String, CodingKey { case type, artifact; case requestId = "request_id" }
+}
+
+public struct ResearchBoardError: Codable, Equatable, Sendable {
+    public let type: String
+    public let requestId: String
+    public let error: String
+    public init(requestId: String, error: String) {
+        self.type = "research_board_error"; self.requestId = requestId; self.error = error
+    }
+    private enum CodingKeys: String, CodingKey { case type, error; case requestId = "request_id" }
+}
