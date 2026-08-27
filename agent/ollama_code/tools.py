@@ -61,7 +61,9 @@ SAFE_TOOLS = {
 }
 
 #: Tools that modify files — auto-allowed in the "accept_edits" mode.
-EDIT_TOOLS = {"write_file", "edit_file", "multi_edit"}
+#: `apply_patch` is the Codex-parity edit tool; it changes files and nothing
+#: else, so it belongs to the same permission class as the native editors.
+EDIT_TOOLS = {"write_file", "edit_file", "multi_edit", "apply_patch"}
 
 
 @dataclass
@@ -86,7 +88,7 @@ class ToolContext:
     #: App-owned process broker. Work submitted here is detached from the
     #: current turn and therefore survives Stop.
     background_service: Callable[[dict[str, Any]], str] | None = None
-    #: Per-turn Solo Swarm executor. It is installed only for eligible Solo
+    #: Per-turn adaptive Solo executor. It is installed only for eligible Solo
     #: turns and removed before the turn identity is released.
     delegate_read_only: Callable[[dict[str, Any]], str] | None = None
 
@@ -437,6 +439,21 @@ def _impl_multi_edit(args: dict[str, Any], ctx: ToolContext) -> str:
     except OSError as e:
         return f"Error writing {path}: {e}"
     return f"Edited {p}: applied {len(edits)} edit(s), {applied} replacement(s)."
+
+
+def _impl_apply_patch(args: dict[str, Any], ctx: ToolContext) -> str:
+    """Apply one Codex ``*** Begin Patch`` envelope. Parity-suite edit tool."""
+    from . import codex_patch
+
+    text = str(args.get("input") or args.get("patch") or "")
+    if not text.strip():
+        return "Error: 'input' must contain a *** Begin Patch envelope."
+    try:
+        return codex_patch.apply_patch(text, ctx)
+    except codex_patch.PatchError as error:
+        return f"Error: {error}"
+    except OSError as error:
+        return f"Error applying patch: {error}"
 
 
 def _impl_bash(args: dict[str, Any], ctx: ToolContext) -> str:
@@ -1050,7 +1067,7 @@ def _impl_capture_context_snapshot(args: dict[str, Any], ctx: ToolContext) -> st
 
 def _impl_delegate_read_only(args: dict[str, Any], ctx: ToolContext) -> str:
     if ctx.delegate_read_only is None:
-        return "Error: Solo Swarm is not active for this turn."
+        return "Error: Solo delegation is not active for this turn."
     return ctx.delegate_read_only(args)
 
 
@@ -1059,6 +1076,7 @@ _IMPLS: dict[str, Callable[[dict[str, Any], ToolContext], str]] = {
     "write_file": _impl_write_file,
     "edit_file": _impl_edit_file,
     "multi_edit": _impl_multi_edit,
+    "apply_patch": _impl_apply_patch,
     "bash": _impl_bash,
     "background_service": _impl_background_service,
     "glob": _impl_glob,

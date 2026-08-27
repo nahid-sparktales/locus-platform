@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 from typing import Any
 
 from .capabilities import enabled as capability_enabled
@@ -30,7 +31,7 @@ _WORKSPACE_READ_TOOLS = {
     "read_file", "glob", "grep", "list_dir", "git_status", "git_diff",
     "search_workspace_knowledge", "load_skill", "read_skill_file", "notes_read",
 }
-_WORKSPACE_WRITE_TOOLS = {"write_file", "edit_file", "multi_edit", "notes_update"}
+_WORKSPACE_WRITE_TOOLS = {"write_file", "edit_file", "multi_edit", "apply_patch", "notes_update"}
 _SHELL_TOOLS = {"bash", "background_service"}
 
 
@@ -69,6 +70,144 @@ def _schema(
             },
         },
     }
+
+
+# --- Codex-native parity tool suite -----------------------------------------
+#
+# Codex-tuned models are trained against a specific tool surface. The parity
+# suite mirrors those tools' shapes so the model stays in-distribution, while
+# execution stays entirely on Locus's side: every call is translated to a
+# canonical built-in by `parity_to_canonical` *before* permission checks and
+# dispatch, so deny lists, accept-edits, capability policy, and previews keep
+# operating on the names they have always known. ("shell_command", the native
+# name, is reserved by the App Server for its own tool and silently dropped
+# from dynamic registrations — "shell", the long-standing Codex name, is not.)
+
+_APPLY_PATCH_DESCRIPTION = """Edit files with a stripped-down, file-oriented diff envelope. Pass the entire patch as the `input` string:
+
+*** Begin Patch
+[ one or more file sections ]
+*** End Patch
+
+Each file section starts with one of three headers:
+*** Add File: <path> - create a new file. Every following line is a + line (the initial contents).
+*** Delete File: <path> - remove an existing file. Nothing follows.
+*** Update File: <path> - patch an existing file in place (optionally with a rename).
+
+An Update section may be immediately followed by *** Move to: <new path> to rename the file, then one or more hunks, each introduced by @@ (optionally followed by the class or function the change belongs to). Within a hunk, each line starts with ' ' (context), '-' (removed), or '+' (added). Show 3 lines of context above and below each change; when that is not unique, use the @@ header to name the enclosing class or function.
+
+Example:
+
+*** Begin Patch
+*** Update File: src/app.py
+@@ def greet():
+-print("Hi")
++print("Hello, world!")
+*** End Patch
+
+File references can only be relative, NEVER ABSOLUTE."""
+
+PARITY_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    _schema(
+        "shell",
+        "Runs a shell command and returns its output.\n"
+        "- Always set the `workdir` param when using the shell function. "
+        "Do not use `cd` unless absolutely necessary.",
+        {
+            "command": {
+                "type": "string",
+                "description": "Shell script to run in the user's default shell.",
+            },
+            "workdir": {
+                "type": "string",
+                "description": "Working directory for the command. Defaults to the turn cwd.",
+            },
+            "timeout_ms": {
+                "type": "number",
+                "description": "Maximum command runtime. Defaults to 10000 ms.",
+            },
+        },
+        ["command"],
+    ),
+    _schema(
+        "apply_patch",
+        _APPLY_PATCH_DESCRIPTION,
+        {
+            "input": {
+                "type": "string",
+                "description": "The complete *** Begin Patch envelope to apply.",
+            },
+        },
+        ["input"],
+    ),
+    _schema(
+        "update_plan",
+        "Updates the task plan. Provide an optional explanation and a list of "
+        "plan items, each with a step and status. At most one step can be "
+        "in_progress at a time.",
+        {
+            "explanation": {"type": "string"},
+            "plan": {
+                "type": "array",
+                "description": "The list of steps",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "step": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "completed"],
+                        },
+                    },
+                    "required": ["step", "status"],
+                },
+            },
+        },
+        ["plan"],
+    ),
+]
+
+#: Which canonical built-in each parity tool executes as. Used both for the
+#: dispatch translation and for applying the user's capability policy to the
+#: advertised parity schemas.
+_PARITY_CANONICAL = {
+    "shell": "bash",
+    "apply_patch": "apply_patch",
+    "update_plan": "todo_write",
+}
+
+
+def parity_to_canonical(name: str, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Translate a parity-suite call to the canonical tool it executes as.
+
+    Runs before permission checks and dispatch, so everything downstream —
+    deny lists, accept-edits, previews, todo events — sees canonical names
+    and argument shapes.
+    """
+    if name == "shell":
+        command = str(arguments.get("command") or "")
+        workdir = str(arguments.get("workdir") or "").strip()
+        if workdir and command:
+            # Folding the workdir into the command keeps the permission
+            # preview an honest picture of exactly what will run.
+            command = f"cd {shlex.quote(workdir)} && {command}"
+        canonical: dict[str, Any] = {"command": command}
+        timeout_ms = arguments.get("timeout_ms")
+        if isinstance(timeout_ms, (int, float)) and timeout_ms > 0:
+            canonical["timeout"] = max(1, round(float(timeout_ms) / 1000))
+        return "bash", canonical
+    if name == "update_plan":
+        plan = arguments.get("plan")
+        todos = [
+            {
+                "content": str(item.get("step") or ""),
+                "status": str(item.get("status") or "pending"),
+            }
+            for item in plan
+            if isinstance(item, dict)
+        ] if isinstance(plan, list) else []
+        return "todo_write", {"todos": todos}
+    return name, dict(arguments)
 
 
 EXTENSION_TOOL_SCHEMAS = [
@@ -197,6 +336,19 @@ def _browser_schema(
 
 
 BROWSER_TOOL_SCHEMAS = [
+    _schema(
+        "browser_history",
+        "Search the user's Locus browsing history when they have explicitly enabled "
+        "agent access. Returns only URL, title, and visit time; no page content or autofill data.",
+        {
+            "query": {"type": "string", "description": "Match a URL or page title."},
+            "date_from": {"type": "string", "description": "Inclusive ISO-8601 start date or time."},
+            "date_to": {"type": "string", "description": "Inclusive ISO-8601 end date or time."},
+            "cursor": {"type": "string", "description": "Opaque cursor from the previous result."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+        },
+        [],
+    ),
     _browser_schema(
         "browser_read_page",
         "Read the open page as a tree of elements. Interactive ones carry a ref_N id "
@@ -391,6 +543,7 @@ BROWSER_TOOL_SCHEMAS = [
 _READ_ONLY_BROWSER_TOOLS = {
     "browser_read_page", "browser_get_text", "browser_find", "browser_screenshot",
     "browser_wait_for", "browser_console", "browser_network", "browser_tabs",
+    "browser_history",
 }
 _BROWSER_TOOL_NAMES = {
     schema["function"]["name"] for schema in BROWSER_TOOL_SCHEMAS
@@ -430,6 +583,71 @@ NOTES_TOOL_SCHEMAS = [
 _READ_ONLY_NOTES_TOOLS = {"notes_read"}
 _NOTES_TOOL_NAMES = {
     schema["function"]["name"] for schema in NOTES_TOOL_SCHEMAS
+}
+
+
+WALLET_TOOL_SCHEMAS = [
+    _schema(
+        "wallet_list_accounts",
+        "List public Locus Vault accounts and chains. Never returns keys or recovery material.",
+        {},
+        [],
+    ),
+    _schema(
+        "wallet_get_balance",
+        "Read balances for one public Locus Vault account.",
+        {"account_id": {"type": "string"}, "network": {"type": "string"}},
+        ["account_id"],
+    ),
+    _schema(
+        "wallet_get_activity",
+        "Read recent on-chain activity for one public Locus Vault account.",
+        {"account_id": {"type": "string"}, "network": {"type": "string"}, "limit": {"type": "integer"}},
+        ["account_id"],
+    ),
+    _schema(
+        "wallet_prepare_transaction",
+        "Prepare and policy-check one decoded transaction without exposing key material. Mainnet requires an active session budget.",
+        {
+            "chain": {"type": "string", "enum": ["evm", "solana", "sui"]},
+            "network": {"type": "string"},
+            "account_id": {"type": "string"},
+            "asset": {"type": "string"},
+            "recipient": {"type": "string"},
+            "contract": {"type": "string"},
+            "operation": {"type": "string"},
+            "amount": {"type": "string", "description": "Exact base-unit or decimal amount as a string."},
+            "maximum_fee": {"type": "string", "description": "Maximum fee as an exact string."},
+            "decoded": {"type": "boolean"},
+            "unlimited_approval": {"type": "boolean"},
+        },
+        ["chain", "network", "account_id", "asset", "recipient", "amount", "maximum_fee", "decoded"],
+    ),
+    _schema(
+        "wallet_simulate_transaction",
+        "Re-simulate one prepared transaction and report decoded asset and fee changes.",
+        {"intent_id": {"type": "string"}},
+        ["intent_id"],
+    ),
+    _schema(
+        "wallet_execute_transaction",
+        "Execute exactly one prepared digest after native policy, expiry, nonce, and simulation checks. No permission mode can bypass the wallet policy.",
+        {"intent_id": {"type": "string"}},
+        ["intent_id"],
+    ),
+    _schema(
+        "wallet_lock",
+        "Lock the Locus Vault immediately and clear all session transaction policies.",
+        {},
+        [],
+    ),
+]
+
+_READ_ONLY_WALLET_TOOLS = {
+    "wallet_list_accounts", "wallet_get_balance", "wallet_get_activity",
+}
+_WALLET_TOOL_NAMES = {
+    schema["function"]["name"] for schema in WALLET_TOOL_SCHEMAS
 }
 
 
@@ -474,9 +692,15 @@ class ToolRegistry:
         #: settings*, but defaulting it on here would make the headless CLI and
         #: every evaluation core advertise tools whose executor is ``None``.
         self.browser_enabled = False
+        # History is a separate opt-in inside Browser Settings. Keeping this
+        # false removes the schema and also rejects guessed calls.
+        self.browser_history_enabled = False
         #: Notes live in the native app, so the headless CLI must not advertise
         #: these schemas until a connected Locus instance announces its broker.
         self.notes_enabled = False
+        #: Full-custody tools are absent until the native app reports a live,
+        #: security-gated signer. Headless mode never advertises them.
+        self.wallet_enabled = False
         self.refresh()
 
     def refresh(self) -> None:
@@ -645,6 +869,10 @@ class ToolRegistry:
             schema for schema in self.notes_schemas()
             if self._user_allows(schema["function"]["name"])
         )
+        schemas.extend(
+            schema for schema in self.wallet_schemas()
+            if self._user_allows(schema["function"]["name"])
+        )
         if (
             self._solo_swarm_enabled
             and self._agent_access_ceiling != "read_only"
@@ -672,6 +900,32 @@ class ToolRegistry:
             })
         return schemas
 
+    def parity_schemas(self, plan_mode: bool = False) -> list[dict[str, Any]]:
+        """The Codex-parity tool surface for a native-mode ChatGPT turn.
+
+        Deliberately minimal: the Codex-native aliases plus Locus's bounded
+        adaptive delegation tool when available. The user's capability policy
+        is applied against each canonical tool, the same gate `schemas()` uses.
+        `submit_plan` joins only in Plan mode, where Locus's plan-approval flow
+        depends on it.
+        """
+        schemas = [
+            schema for schema in PARITY_TOOL_SCHEMAS
+            if self._user_allows(_PARITY_CANONICAL[schema["function"]["name"]])
+        ]
+        if (
+            self._solo_swarm_enabled
+            and self._agent_access_ceiling != "read_only"
+            and self._user_allows("delegate_read_only")
+        ):
+            schemas.append(DELEGATE_READ_ONLY_SCHEMA)
+        if plan_mode:
+            schemas.extend(
+                schema for schema in TOOL_SCHEMAS
+                if schema["function"]["name"] == "submit_plan"
+            )
+        return schemas
+
     def browser_schemas(self) -> list[dict[str, Any]]:
         """Browser tools this agent may see.
 
@@ -696,6 +950,8 @@ class ToolRegistry:
         """
         if not self.browser_enabled or name not in _BROWSER_TOOL_NAMES:
             return False
+        if name == "browser_history" and not self.browser_history_enabled:
+            return False
         if self._agent_access_ceiling == "read_only":
             return name in _READ_ONLY_BROWSER_TOOLS
         return True
@@ -713,6 +969,21 @@ class ToolRegistry:
             return False
         if self._agent_access_ceiling == "read_only":
             return name in _READ_ONLY_NOTES_TOOLS
+        return True
+
+    def wallet_schemas(self) -> list[dict[str, Any]]:
+        if not self.wallet_enabled:
+            return []
+        return [
+            schema for schema in WALLET_TOOL_SCHEMAS
+            if self.wallet_tool_allowed(schema["function"]["name"])
+        ]
+
+    def wallet_tool_allowed(self, name: str) -> bool:
+        if not self.wallet_enabled or name not in _WALLET_TOOL_NAMES:
+            return False
+        if self._agent_access_ceiling == "read_only":
+            return name in _READ_ONLY_WALLET_TOOLS
         return True
 
     def schema_tokens(self) -> int:
@@ -924,9 +1195,11 @@ class ToolRegistry:
             return self._solo_swarm_enabled and self._user_allows(name)
         if self.computer_enabled and name in _READ_ONLY_COMPUTER_TOOLS:
             return True
-        if self.browser_enabled and name in _READ_ONLY_BROWSER_TOOLS:
+        if self.browser_tool_allowed(name) and name in _READ_ONLY_BROWSER_TOOLS:
             return True
         if self.notes_enabled and name in _READ_ONLY_NOTES_TOOLS:
+            return True
+        if self.wallet_enabled and name in _READ_ONLY_WALLET_TOOLS:
             return True
         if name in _SAFE_EXTENSION_TOOLS and (
             name not in _MODERN_MCP_TOOLS or capability_enabled("modern_mcp")
@@ -995,7 +1268,7 @@ class ToolRegistry:
             }
         # Gated on the flag, so a call made while the browser is off falls
         # through to the unknown-tool path rather than reaching a dead executor.
-        if self.browser_enabled and name in _BROWSER_TOOL_NAMES:
+        if self.browser_tool_allowed(name):
             return {
                 "origin": "browser",
                 "annotations": {"readOnlyHint": name in _READ_ONLY_BROWSER_TOOLS},
@@ -1004,6 +1277,14 @@ class ToolRegistry:
             return {
                 "origin": "notes",
                 "annotations": {"readOnlyHint": name in _READ_ONLY_NOTES_TOOLS},
+            }
+        if self.wallet_tool_allowed(name):
+            return {
+                "origin": "wallet",
+                "annotations": {
+                    "readOnlyHint": name in _READ_ONLY_WALLET_TOOLS,
+                    "destructiveHint": name == "wallet_execute_transaction",
+                },
             }
         if name in _SAFE_EXTENSION_TOOLS:
             return {"origin": "extension", "annotations": {"readOnlyHint": True}}
@@ -1029,6 +1310,7 @@ class ToolRegistry:
             base_schemas.extend(COMPUTER_TOOL_SCHEMAS)
         base_schemas.extend(self.browser_schemas())
         base_schemas.extend(self.notes_schemas())
+        base_schemas.extend(self.wallet_schemas())
         for schema in base_schemas:
             fn = schema["function"]
             out.append({
@@ -1043,6 +1325,7 @@ class ToolRegistry:
                     else "native" if schema in COMPUTER_TOOL_SCHEMAS
                     else "browser" if schema in BROWSER_TOOL_SCHEMAS
                     else "notes" if schema in NOTES_TOOL_SCHEMAS
+                    else "wallet" if schema in WALLET_TOOL_SCHEMAS
                     else "extension"
                 ),
                 "active": True,
@@ -1052,6 +1335,7 @@ class ToolRegistry:
                     or fn["name"] in _READ_ONLY_COMPUTER_TOOLS
                     or fn["name"] in _READ_ONLY_BROWSER_TOOLS
                     or fn["name"] in _READ_ONLY_NOTES_TOOLS
+                    or fn["name"] in _READ_ONLY_WALLET_TOOLS
                 },
             })
         for name, tool in sorted(self._mcp_by_qualified.items()):

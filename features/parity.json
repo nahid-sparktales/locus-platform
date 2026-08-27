@@ -46,6 +46,7 @@
     "browser.live-recording-context",
     "browser.local-encrypted-transcripts",
     "browser.private-semantic-recall",
+    "browser.history-explicit-opt-in",
     "browser.cited-research-boards",
     "browser.ai-tab-steward",
     "browser.two-page-split-view",
@@ -53,6 +54,7 @@
     "browser.reader-read-aloud",
     "computer-control.macos-direct",
     "mobile.companion-access",
+    "wallet.native-policy-gateway",
     "network.proxy",
     "updates.signed-component-and-app",
     "privacy.local-first"

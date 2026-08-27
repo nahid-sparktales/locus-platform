@@ -3,6 +3,7 @@ import { z } from "zod";
 export const protocolVersion = 1 as const;
 
 export const browserToolNames = [
+  "browser_history",
   "browser_read_page",
   "browser_get_text",
   "browser_find",
@@ -39,6 +40,7 @@ export type TabAccessGrant = z.infer<typeof TabAccessGrantSchema>;
 export const SetBrowserControlSchema = z.object({
   type: z.literal("set_browser_control"),
   enabled: z.boolean(),
+  history_enabled: z.boolean().optional(),
 });
 
 export const BrowserActionRequestSchema = z.object({
@@ -79,6 +81,49 @@ export const BrowserActionResultSchema = z.object({
 });
 
 export type BrowserActionResult = z.infer<typeof BrowserActionResultSchema>;
+
+export const walletToolNames = [
+  "wallet_list_accounts",
+  "wallet_get_balance",
+  "wallet_get_activity",
+  "wallet_prepare_transaction",
+  "wallet_simulate_transaction",
+  "wallet_execute_transaction",
+  "wallet_lock",
+] as const;
+
+export const WalletToolNameSchema = z.enum(walletToolNames);
+export type WalletToolName = z.infer<typeof WalletToolNameSchema>;
+
+export const SetWalletControlSchema = z.object({
+  type: z.literal("set_wallet_control"),
+  enabled: z.boolean(),
+});
+
+export const WalletActionRequestSchema = z.object({
+  type: z.literal("wallet_action_request"),
+  request_id: z.string().min(1),
+  tool: WalletToolNameSchema,
+  arguments: z.record(z.string(), z.unknown()).default({}),
+  timeout_ms: z.number().int().min(1).max(60_000),
+  session_id: z.string().min(1),
+});
+export type WalletActionRequest = z.infer<typeof WalletActionRequestSchema>;
+
+export const WalletActionPayloadSchema = z.object({
+  text: z.string().optional(),
+  error: z.string().optional(),
+}).passthrough().refine(
+  (value) => value.text !== undefined || value.error !== undefined,
+  "A wallet result must contain text or error",
+);
+
+export const WalletActionResultSchema = z.object({
+  type: z.literal("wallet_action_result"),
+  request_id: z.string().min(1),
+  result: WalletActionPayloadSchema,
+});
+export type WalletActionResult = z.infer<typeof WalletActionResultSchema>;
 
 export const RecordingTranscriptSourceSchema = z.enum(["tab", "microphone"]);
 export type RecordingTranscriptSource = z.infer<typeof RecordingTranscriptSourceSchema>;
@@ -261,11 +306,30 @@ export const ResearchBoardErrorSchema = z.object({
   error: z.string().min(1).max(4_000),
 });
 
+export const PortableMemoryRecordSchema = z.object({
+  blob_id: z.string().trim().min(1).max(512),
+  text: z.string().trim().min(1).max(12_000),
+  title: z.string().trim().max(2_048).optional(),
+  source_url: z.string().trim().url().max(8_192).refine(
+    (value) => /^https?:\/\//.test(value),
+    "Portable memory source URL must use HTTP or HTTPS",
+  ).optional(),
+  captured_at: z.string().datetime().optional(),
+  content_sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+});
+export type PortableMemoryRecord = z.infer<typeof PortableMemoryRecordSchema>;
+
+export const PortableMemorySchema = z.array(PortableMemoryRecordSchema).max(5).superRefine((records, issue) => {
+  const characters = records.reduce((total, record) => total + record.text.length, 0);
+  if (characters > 12_000) issue.addIssue({ code: "custom", message: "Portable memory exceeds 12,000 characters" });
+});
+
 export const AgentUserMessageSchema = z.object({
   type: z.literal("user_message"),
   text: z.string().trim().min(1).max(200_000),
   mode: z.enum(["ask", "work", "plan", "build"]).optional(),
   browser_context: BrowserObservationContextSchema.optional(),
+  portable_memory: PortableMemorySchema.optional(),
 }).passthrough();
 export type AgentUserMessage = z.infer<typeof AgentUserMessageSchema>;
 
@@ -291,6 +355,8 @@ export type BrowserTabSnapshot = z.infer<typeof BrowserTabSnapshotSchema>;
 export const ClientAgentMessageSchema = z.discriminatedUnion("type", [
   SetBrowserControlSchema,
   BrowserActionResultSchema,
+  SetWalletControlSchema,
+  WalletActionResultSchema,
   AgentUserMessageSchema,
   ResearchBoardRequestSchema,
 ]);

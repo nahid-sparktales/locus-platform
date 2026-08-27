@@ -1,5 +1,7 @@
 {
-  "setBrowserControl": { "type": "set_browser_control", "enabled": true },
+  "setBrowserControl": {
+    "type": "set_browser_control", "enabled": true, "history_enabled": true
+  },
   "browserActionRequest": {
     "type": "browser_action_request", "request_id": "request-1",
     "tool": "browser_read_page", "arguments": { "filter": "interactive" },
@@ -9,6 +11,17 @@
   "browserActionResult": {
     "type": "browser_action_result", "request_id": "request-1",
     "result": { "text": "Example — https://example.com" }
+  },
+  "walletControl": { "type": "set_wallet_control", "enabled": true },
+  "walletActionRequest": {
+    "type": "wallet_action_request", "request_id": "wallet-1",
+    "tool": "wallet_prepare_transaction",
+    "arguments": { "chain": "evm", "amount": "1.0" },
+    "timeout_ms": 60000, "session_id": "session-1"
+  },
+  "walletActionResult": {
+    "type": "wallet_action_result", "request_id": "wallet-1",
+    "result": { "error": "native policy rejected the request" }
   },
   "speechSettings": {
     "engine": "local", "language": "auto", "local_model_status": "ready"
@@ -35,7 +48,14 @@
         { "source": "microphone", "start_ms": 0, "end_ms": 1200, "text": "Open the first result" }
       ],
       "page_text": "Example page"
-    }
+    },
+    "portable_memory": [{
+      "blob_id": "walrus-blob-1", "title": "Saved finding",
+      "source_url": "https://example.com/report",
+      "captured_at": "2026-08-26T12:00:00.000Z",
+      "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "text": "A recalled conclusion that is untrusted evidence."
+    }]
   },
   "researchBoardRequest": {
     "type": "research_board_request", "request_id": "research-1",

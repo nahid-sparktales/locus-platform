@@ -3,6 +3,7 @@
 import Foundation
 
 public enum BrowserToolName: String, Codable, CaseIterable, Sendable {
+    case history = "browser_history"
     case readPage = "browser_read_page"
     case getText = "browser_get_text"
     case find = "browser_find"
@@ -16,6 +17,21 @@ public enum BrowserToolName: String, Codable, CaseIterable, Sendable {
     case resize = "browser_resize"
     case javascript = "browser_javascript"
     case devServer = "browser_dev_server"
+}
+
+public struct SetBrowserControl: Codable, Equatable, Sendable {
+    public let type: String
+    public let enabled: Bool
+    public let historyEnabled: Bool?
+
+    public init(enabled: Bool, historyEnabled: Bool? = nil) {
+        self.type = "set_browser_control"; self.enabled = enabled
+        self.historyEnabled = historyEnabled
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case type, enabled; case historyEnabled = "history_enabled"
+    }
 }
 
 public enum TabAccessLevel: String, Codable, Sendable { case read, interact }
@@ -119,6 +135,66 @@ public struct BrowserActionResult: Codable, Equatable, Sendable {
     public let requestId: String
     public let result: BrowserActionPayload
     public init(requestId: String, result: BrowserActionPayload) { self.type = "browser_action_result"; self.requestId = requestId; self.result = result }
+    private enum CodingKeys: String, CodingKey { case type, result; case requestId = "request_id" }
+}
+
+public enum WalletToolName: String, Codable, CaseIterable, Sendable {
+    case listAccounts = "wallet_list_accounts"
+    case getBalance = "wallet_get_balance"
+    case getActivity = "wallet_get_activity"
+    case prepareTransaction = "wallet_prepare_transaction"
+    case simulateTransaction = "wallet_simulate_transaction"
+    case executeTransaction = "wallet_execute_transaction"
+    case lock = "wallet_lock"
+}
+
+public struct SetWalletControl: Codable, Equatable, Sendable {
+    public let type: String
+    public let enabled: Bool
+
+    public init(enabled: Bool) {
+        self.type = "set_wallet_control"; self.enabled = enabled
+    }
+}
+
+public struct WalletActionRequest: Codable, Equatable, Sendable {
+    public let type: String
+    public let requestId: String
+    public let tool: WalletToolName
+    public let arguments: [String: JSONValue]
+    public let timeoutMs: Int
+    public let sessionId: String
+
+    public init(requestId: String, tool: WalletToolName, arguments: [String: JSONValue], timeoutMs: Int, sessionId: String) {
+        self.type = "wallet_action_request"; self.requestId = requestId; self.tool = tool
+        self.arguments = arguments; self.timeoutMs = timeoutMs; self.sessionId = sessionId
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case type, tool, arguments
+        case requestId = "request_id"; case timeoutMs = "timeout_ms"; case sessionId = "session_id"
+    }
+}
+
+public struct WalletActionPayload: Codable, Equatable, Sendable {
+    public let text: String?
+    public let error: String?
+
+    public init(text: String? = nil, error: String? = nil) {
+        precondition(text != nil || error != nil, "A wallet result must contain text or error")
+        self.text = text; self.error = error
+    }
+}
+
+public struct WalletActionResult: Codable, Equatable, Sendable {
+    public let type: String
+    public let requestId: String
+    public let result: WalletActionPayload
+
+    public init(requestId: String, result: WalletActionPayload) {
+        self.type = "wallet_action_result"; self.requestId = requestId; self.result = result
+    }
+
     private enum CodingKeys: String, CodingKey { case type, result; case requestId = "request_id" }
 }
 
@@ -302,20 +378,41 @@ public struct BrowserObservationContext: Codable, Equatable, Sendable {
     }
 }
 
+public struct PortableMemoryRecord: Codable, Equatable, Sendable {
+    public let blobId: String
+    public let text: String
+    public let title: String?
+    public let sourceURL: String?
+    public let capturedAt: String?
+    public let contentSHA256: String?
+
+    public init(blobId: String, text: String, title: String? = nil, sourceURL: String? = nil, capturedAt: String? = nil, contentSHA256: String? = nil) {
+        self.blobId = blobId; self.text = text; self.title = title
+        self.sourceURL = sourceURL; self.capturedAt = capturedAt
+        self.contentSHA256 = contentSHA256
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case text, title; case blobId = "blob_id"; case sourceURL = "source_url"
+        case capturedAt = "captured_at"; case contentSHA256 = "content_sha256"
+    }
+}
+
 public struct AgentUserMessage: Codable, Equatable, Sendable {
     public let type: String
     public let text: String
     public let mode: String?
     public let browserContext: BrowserObservationContext?
+    public let portableMemory: [PortableMemoryRecord]?
 
-    public init(text: String, mode: String? = nil, browserContext: BrowserObservationContext? = nil) {
+    public init(text: String, mode: String? = nil, browserContext: BrowserObservationContext? = nil, portableMemory: [PortableMemoryRecord]? = nil) {
         self.type = "user_message"; self.text = text; self.mode = mode
-        self.browserContext = browserContext
+        self.browserContext = browserContext; self.portableMemory = portableMemory
     }
 
     private enum CodingKeys: String, CodingKey {
         case type, text, mode
-        case browserContext = "browser_context"
+        case browserContext = "browser_context"; case portableMemory = "portable_memory"
     }
 }
 
