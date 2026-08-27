@@ -3,9 +3,17 @@ import Testing
 @testable import LocusProtocol
 
 @Test func browserToolParityIsStable() {
-    #expect(BrowserToolName.allCases.count == 13)
+    #expect(BrowserToolName.allCases.count == 14)
+    #expect(BrowserToolName.history.rawValue == "browser_history")
     #expect(BrowserToolName.readPage.rawValue == "browser_read_page")
     #expect(BrowserToolName.devServer.rawValue == "browser_dev_server")
+}
+
+@Test func browserHistoryUsesAnIndependentOptIn() throws {
+    let control = SetBrowserControl(enabled: true, historyEnabled: true)
+    let object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(control)) as? [String: Any])
+    #expect(object["type"] as? String == "set_browser_control")
+    #expect(object["history_enabled"] as? Bool == true)
 }
 
 @Test func requestUsesWireCompatibleSnakeCase() throws {
@@ -40,6 +48,36 @@ import Testing
     let context = try #require(object["browser_context"] as? [String: Any])
     #expect(context["recording_id"] as? String == "recording-1")
     #expect((context["active_tab"] as? [String: Any])?["access_level"] as? String == "interact")
+}
+
+@Test func portableMemoryAndWalletMessagesKeepProvenanceAndSnakeCase() throws {
+    let message = AgentUserMessage(
+        text: "Use my saved finding",
+        portableMemory: [PortableMemoryRecord(
+            blobId: "walrus-blob-1", text: "Saved evidence", title: "Finding",
+            sourceURL: "https://example.com/report", capturedAt: "2026-08-26T12:00:00.000Z",
+            contentSHA256: String(repeating: "a", count: 64)
+        )]
+    )
+    let messageObject = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(message)) as? [String: Any])
+    let memories = try #require(messageObject["portable_memory"] as? [[String: Any]])
+    #expect(memories.first?["blob_id"] as? String == "walrus-blob-1")
+    #expect(memories.first?["content_sha256"] as? String == String(repeating: "a", count: 64))
+
+    let request = WalletActionRequest(
+        requestId: "wallet-1", tool: .prepareTransaction,
+        arguments: ["chain": .string("evm"), "amount": .string("1.0")],
+        timeoutMs: 60_000, sessionId: "session-1"
+    )
+    let requestObject = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any])
+    #expect(requestObject["request_id"] as? String == "wallet-1")
+    #expect(requestObject["tool"] as? String == "wallet_prepare_transaction")
+
+    let result = WalletActionResult(
+        requestId: "wallet-1", result: WalletActionPayload(error: "policy rejected")
+    )
+    let resultObject = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(result)) as? [String: Any])
+    #expect((resultObject["result"] as? [String: Any])?["error"] as? String == "policy rejected")
 }
 
 @Test func recordingStateUsesGeneratedSnakeCase() throws {

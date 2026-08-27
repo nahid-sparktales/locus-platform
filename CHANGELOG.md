@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.0-canary.6 — 2026-08-27
+
+Synchronizes the shared agent runtime with Locus 2.0 development: Codex-native
+ChatGPT routing and patch application, model routing and proxy profiles,
+resilient session provenance, automatic bounded Solo delegation, and the latest
+team-budget contracts. It also adds three additive, fail-closed broker
+contracts: separately opted-in browsing-history search, portable memory wrapped
+as bounded untrusted evidence, and a native Locus Vault gateway whose signer
+policy cannot be bypassed by agent permission mode.
+
 ## 0.1.0-canary.5 — 2026-08-24
 
 Adds the private browser-intelligence contracts: a signed macOS semantic helper

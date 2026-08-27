@@ -6,6 +6,9 @@
     { "$ref": "#/$defs/setBrowserControl" },
     { "$ref": "#/$defs/browserActionRequest" },
     { "$ref": "#/$defs/browserActionResult" },
+    { "$ref": "#/$defs/setWalletControl" },
+    { "$ref": "#/$defs/walletActionRequest" },
+    { "$ref": "#/$defs/walletActionResult" },
     { "$ref": "#/$defs/agentUserMessage" },
     { "$ref": "#/$defs/researchBoardRequest" },
     { "$ref": "#/$defs/researchBoardProgress" },
@@ -18,7 +21,8 @@
       "required": ["type", "enabled"],
       "properties": {
         "type": { "const": "set_browser_control" },
-        "enabled": { "type": "boolean" }
+        "enabled": { "type": "boolean" },
+        "history_enabled": { "type": "boolean" }
       },
       "additionalProperties": false
     },
@@ -30,6 +34,7 @@
         "request_id": { "type": "string", "minLength": 1 },
         "tool": {
           "enum": [
+            "browser_history",
             "browser_read_page", "browser_get_text", "browser_find",
             "browser_navigate", "browser_tabs", "browser_input",
             "browser_screenshot", "browser_wait_for", "browser_console",
@@ -57,6 +62,55 @@
       "required": ["type", "request_id", "result"],
       "properties": {
         "type": { "const": "browser_action_result" },
+        "request_id": { "type": "string", "minLength": 1 },
+        "result": {
+          "type": "object",
+          "properties": {
+            "text": { "type": "string" },
+            "error": { "type": "string" }
+          },
+          "anyOf": [
+            { "required": ["text"] },
+            { "required": ["error"] }
+          ],
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "setWalletControl": {
+      "type": "object",
+      "required": ["type", "enabled"],
+      "properties": {
+        "type": { "const": "set_wallet_control" },
+        "enabled": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "walletActionRequest": {
+      "type": "object",
+      "required": ["type", "request_id", "tool", "arguments", "timeout_ms", "session_id"],
+      "properties": {
+        "type": { "const": "wallet_action_request" },
+        "request_id": { "type": "string", "minLength": 1 },
+        "tool": {
+          "enum": [
+            "wallet_list_accounts", "wallet_get_balance", "wallet_get_activity",
+            "wallet_prepare_transaction", "wallet_simulate_transaction",
+            "wallet_execute_transaction", "wallet_lock"
+          ]
+        },
+        "arguments": { "type": "object" },
+        "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 60000 },
+        "session_id": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "walletActionResult": {
+      "type": "object",
+      "required": ["type", "request_id", "result"],
+      "properties": {
+        "type": { "const": "wallet_action_result" },
         "request_id": { "type": "string", "minLength": 1 },
         "result": {
           "type": "object",
@@ -197,9 +251,27 @@
         "type": { "const": "user_message" },
         "text": { "type": "string", "minLength": 1, "maxLength": 200000 },
         "mode": { "enum": ["ask", "work", "plan", "build"] },
-        "browser_context": { "$ref": "#/$defs/browserObservationContext" }
+        "browser_context": { "$ref": "#/$defs/browserObservationContext" },
+        "portable_memory": {
+          "type": "array",
+          "maxItems": 5,
+          "items": { "$ref": "#/$defs/portableMemoryRecord" }
+        }
       },
       "additionalProperties": true
+    },
+    "portableMemoryRecord": {
+      "type": "object",
+      "required": ["blob_id", "text"],
+      "properties": {
+        "blob_id": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "text": { "type": "string", "minLength": 1, "maxLength": 12000 },
+        "title": { "type": "string", "maxLength": 2048 },
+        "source_url": { "type": "string", "format": "uri", "pattern": "^https?://", "maxLength": 8192 },
+        "captured_at": { "type": "string", "format": "date-time" },
+        "content_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      },
+      "additionalProperties": false
     },
     "researchPassage": {
       "type": "object",

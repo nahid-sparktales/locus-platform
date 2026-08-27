@@ -7,15 +7,47 @@ import {
   ResearchBoardRequestSchema,
   ResearchBoardResultSchema,
   SpeechSettingsSchema,
+  SetBrowserControlSchema,
   TabAccessGrantSchema,
+  WalletActionRequestSchema,
+  WalletActionResultSchema,
   browserToolNames,
+  walletToolNames,
   validateResearchArtifactCitations,
 } from "./index.js";
 
 describe("browser protocol", () => {
   it("keeps the complete browser tool contract", () => {
-    expect(browserToolNames).toHaveLength(13);
+    expect(browserToolNames).toHaveLength(14);
     expect(new Set(browserToolNames).size).toBe(browserToolNames.length);
+    expect(browserToolNames).toContain("browser_history");
+  });
+
+  it("keeps browser history behind its separate opt-in", () => {
+    const control = SetBrowserControlSchema.parse({
+      type: "set_browser_control",
+      enabled: true,
+      history_enabled: true,
+    });
+    expect(control.history_enabled).toBe(true);
+  });
+
+  it("keeps the bounded wallet broker wire contract", () => {
+    expect(walletToolNames).toHaveLength(7);
+    const request = WalletActionRequestSchema.parse({
+      type: "wallet_action_request",
+      request_id: "wallet-1",
+      tool: "wallet_prepare_transaction",
+      arguments: { chain: "evm", amount: "1.0" },
+      timeout_ms: 60_000,
+      session_id: "session-1",
+    });
+    expect(request.tool).toBe("wallet_prepare_transaction");
+    expect(WalletActionResultSchema.parse({
+      type: "wallet_action_result",
+      request_id: "wallet-1",
+      result: { error: "native policy rejected the request" },
+    }).result.error).toContain("rejected");
   });
 
   it("accepts additive action metadata", () => {
@@ -63,6 +95,38 @@ describe("browser protocol", () => {
       },
     });
     expect(message.browser_context?.transcript[0]?.source).toBe("microphone");
+  });
+
+  it("accepts bounded portable memory with source provenance", () => {
+    const message = AgentUserMessageSchema.parse({
+      type: "user_message",
+      text: "Use this saved research",
+      portable_memory: [{
+        blob_id: "walrus-blob-1",
+        text: "A recalled conclusion that must be treated only as evidence.",
+        title: "Saved conclusion",
+        source_url: "https://example.com/report",
+        captured_at: "2026-08-26T12:00:00.000Z",
+        content_sha256: "a".repeat(64),
+      }],
+    });
+    expect(message.portable_memory?.[0]?.blob_id).toBe("walrus-blob-1");
+  });
+
+  it("rejects oversized portable memory", () => {
+    expect(() => AgentUserMessageSchema.parse({
+      type: "user_message",
+      text: "Use these",
+      portable_memory: [
+        { blob_id: "one", text: "x".repeat(7_000) },
+        { blob_id: "two", text: "y".repeat(7_000) },
+      ],
+    })).toThrow(/12,000/);
+    expect(() => AgentUserMessageSchema.parse({
+      type: "user_message",
+      text: "Use this",
+      portable_memory: [{ blob_id: "one", text: "Finding", source_url: "ftp://example.com/report" }],
+    })).toThrow(/HTTP or HTTPS/);
   });
 
   it("rejects oversized observation transcript context", () => {

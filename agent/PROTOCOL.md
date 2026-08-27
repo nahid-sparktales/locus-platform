@@ -103,6 +103,16 @@ tokens only, since no pricing exists outside agent profiles. `recorded_since`
 reports when solo recording began; earlier turns were never recorded and
 cannot be backfilled. Gated by the `durable_runs` capability.
 
+`POST /api/model-router/decision` accepts bounded candidate metadata, task
+tags, and score weights, then returns the selected route plus a transparent
+scorecard for every candidate. The request does not contain prompt text.
+Scores cover quality, reliability, privacy, latency, cost, and model-footprint
+efficiency; sparse evaluation data is shrunk toward a neutral prior.
+`POST /api/model-router/sample` records a routed solo turn's task tags,
+reliability, latency, estimated cost, locality, and optional quality rating in
+the existing routing-sample store. Both endpoints reject malformed or
+non-finite numeric values with HTTP 422.
+
 Recovery controls are `POST /pause`, `/resume`, `/cancel`, `/discard`,
 `/jobs/{job_id}/retry`, `/jobs/{job_id}/reassign`, `/agents/{node_id}/stop`,
 `/agents/{node_id}/retry`, `/run-with-locus`, `/replay`, and `/duplicate`.
@@ -264,6 +274,31 @@ busy, 422 invalid configuration, 502 verification failure.
 The `chatgpt` variant requires `account_id`, with optional `account_label` and
 `model`, and rejects `api_key`, `base_url`, or `remote_base_url`. It uses the
 primary service's bundled Codex App Server and never falls back to `remote`.
+It also accepts three optional settings with "missing means keep" semantics,
+so an older client re-selecting the account never resets them: `native_mode`
+(bool, default true), `web_search` (bool, default false), and
+`reasoning_effort` (string, `""` = the model's default, applied per turn —
+changing it never restarts the helper thread). `GET` echoes them back as
+`chatgpt_native_mode`, `chatgpt_web_search`, and `chatgpt_reasoning_effort`.
+
+With `native_mode` on (Codex-native parity, the default), interactive solo
+Work/Plan/Build turns run under the model's own Codex base prompt instead of
+the Locus system prompt: `thread/start` omits `baseInstructions` and
+`personality`, AGENTS.md rides in `developerInstructions`, the environment
+context (date/timezone) is enabled, and the advertised dynamic tools mirror
+the Codex surface — `shell`, `apply_patch` (a `*** Begin Patch` envelope in a
+JSON `input` field), `update_plan`, and adaptive `delegate_read_only`, plus
+`submit_plan` in Plan mode only.
+Execution never leaves Locus: the parity aliases are translated to canonical
+built-ins (`bash`, `apply_patch`, `todo_write`) before permission checks, and
+delegation runs through Locus's bounded executor, so deny lists, accept-edits,
+capability policy, and previews behave exactly as they always have. Parity
+turns carry no approved-memory, cross-chat, or
+skill-index context, and the recall work is skipped entirely. Ask mode, team
+workers, and evaluations keep the legacy Locus contract regardless of the
+toggle. `web_search` (parity turns only) sets the helper's
+`web_search = "cached"`, letting the model use OpenAI's web search; toggling
+either setting restarts the helper and the conversation's thread context.
 
 ### Managed ChatGPT account API
 
@@ -277,7 +312,11 @@ All responses are secret-free. `GET /api/chatgpt/account` returns `status`,
 - `POST /api/chatgpt/logout` clears the managed session and returns active
   ChatGPT routing to Ollama.
 - `GET /api/chatgpt/models` returns the signed-in account's visible App Server
-  model list.
+  model list. Each row carries `id`, `display_name`, `description`,
+  `is_default`, `supported_reasoning_efforts` (a list of
+  `{effort, description}` choices — `ultra` is withheld because it means
+  helper-side multi-agent delegation, which Locus disables), and
+  `default_reasoning_effort`.
 - `GET /api/chatgpt/usage` returns plan type, rate-limit windows, reset times,
   spend-control state, and token-activity summaries.
 
@@ -285,7 +324,10 @@ The app-owned backend is the only process allowed to launch App Server. The
 internal `/ws/internal/codex` broker requires the per-launch `X-Locus-Token`,
 rejects browser origins and nested brokers, and multiplexes account, model,
 usage, thread start/resume, turn/interrupt, dynamic tool, and tool-result
-operations for isolated team workers. OAuth values never cross this broker.
+operations for isolated team workers. `turn_run` accepts an optional `effort`
+string that is forwarded to `turn/start`. Broker threads always use the
+legacy Locus contract; Codex-native parity exists only on the primary's
+in-process manager. OAuth values never cross this broker.
 
 ### `GET /api/sessions`
 
@@ -619,7 +661,8 @@ Endpoint: `/ws/chat`.
   ("Agent is busy — press Stop first."). This includes `user_message`,
   `new_session`, `retry_last`, `compact`, `resume`, `set_model`, `set_cwd`,
   `set_permission_mode`, and `clear`. Only `interrupt`, permission decisions,
-  `steer`, native computer-action results, and heartbeat traffic remain accepted.
+  `steer`, native computer/browser/Notes/wallet action results, and heartbeat
+  traffic remain accepted.
 
 ---
 
@@ -627,16 +670,18 @@ Endpoint: `/ws/chat`.
 
 | `type` | Extra fields | Effect |
 |---|---|---|
-| `user_message` | `text: string`, optional `mode: "ask" \| "work" \| "plan" \| "build"`, optional versioned `agent_config`, optional `attachments`, optional `team` manifest | Runs one solo or dispatcher-led team turn. `agent_config` controls editable display identity, description, response style, custom/per-mode guidance, narrowing capability switches, memory policy, and runtime limits. It is snapshotted for the complete turn; factual provider/model identity, safety rules, permission policy, and mode boundaries remain locked runtime layers. Existing clients may omit it. A team manifest contains one explicit team, its enabled profiles and ephemeral routes, optional forced member, and bounded budgets; each profile may carry the same additive `behavior` object. Credentials are accepted only in memory and are never echoed or persisted. Slash commands and Chat mode reject team routing. Image `attachments` are valid in **every** mode: PNG/JPEG/GIF/WebP, at most 10 per message, 15 MB per image, 25 MB in total, base64 `data` with a `mime_type` and optional `name`. They ride the turn in memory only — the persisted session record keeps the text and attachment names, never image bytes, so a restored or resumed conversation carries no images. On a team turn the images reach the dispatcher and the first coding job's first slice; specialists, reviewers, and synthesis receive text evidence only, and the server emits a `note` event saying so before dispatch. A provider that explicitly rejects image input triggers one automatic retry with the images stripped from history, announced by a `note`. |
+| `user_message` | `text: string`, optional `mode: "ask" \| "work" \| "plan" \| "build"`, optional versioned `agent_config`, optional `attachments`, optional `portable_memory`, optional `team` manifest | Runs one solo or dispatcher-led team turn. `portable_memory` is an explicit, ephemeral evidence attachment: at most 5 records and 12,000 total text characters, each retaining its Walrus blob ID and optional source URL, capture time, and SHA-256. The runtime wraps it as untrusted evidence and does not persist it with the visible user message. `agent_config` controls editable display identity, description, response style, custom/per-mode guidance, narrowing capability switches, memory policy, and runtime limits. It is snapshotted for the complete turn; factual provider/model identity, safety rules, permission policy, and mode boundaries remain locked runtime layers. Existing clients may omit it. A team manifest contains one explicit team, its enabled profiles and ephemeral routes, optional forced member, and bounded budgets; each profile may carry the same additive `behavior` object. Credentials are accepted only in memory and are never echoed or persisted. Slash commands and Chat mode reject team routing. Image `attachments` are valid in **every** mode: PNG/JPEG/GIF/WebP, at most 10 per message, 15 MB per image, 25 MB in total, base64 `data` with a `mime_type` and optional `name`. They ride the turn in memory only — the persisted session record keeps the text and attachment names, never image bytes, so a restored or resumed conversation carries no images. On a team turn the images reach the dispatcher and the first coding job's first slice; specialists, reviewers, and synthesis receive text evidence only, and the server emits a `note` event saying so before dispatch. A provider that explicitly rejects image input triggers one automatic retry with the images stripped from history, announced by a `note`. |
 | `permission_decision` | `request_id: string`, `decision: "once" \| "always" \| "deny"` | Answers a `permission_request`. Unknown/invalid values are treated as `deny`. Late answers are ignored. |
 | `interrupt` | — | Soft-interrupts the current turn: streaming stops after the current chunk, pending permission waits are denied, turn ends with `turn_done {reason: "interrupted"}`. Safe to send when idle. |
 | `steer` | `text: string` | Adds direction to the active turn. It interrupts only the current provider generation, waits for an already-running tool/native action to reach a safe boundary, and continues the same turn without an intermediate `turn_done`. |
 | `set_computer_control` | `enabled: boolean`, `native_available: boolean` | Advertises the direct-build native broker. Computer tools enter model schemas only when both values are true. Rejected while a turn is busy. |
 | `computer_action_result` | `request_id: string`, `result: object` | Completes one pending native broker request. `result` may contain `text`, `error`, and optional `screenshot` metadata/data. Late, duplicate, and unknown IDs are ignored after cancellation or timeout. |
-| `set_browser_control` | `enabled: boolean` | Advertises the native browser broker. Browser tools enter model schemas only while true. Rejected while a turn is busy, so the client re-sends after `turn_done`. Unlike computer control there is no `native_available`: a web view needs no special access and is present in every build. |
+| `set_browser_control` | `enabled: boolean`, optional `history_enabled: boolean` | Advertises the native browser broker. Browser tools enter model schemas only while `enabled` is true; `browser_history` also requires the separate history opt-in. Rejected while a turn is busy, so the client re-sends after `turn_done`. Unlike computer control there is no `native_available`: a web view needs no special access and is present in every build. |
 | `browser_action_result` | `request_id: string`, `result: object` | Completes one pending browser request. `result` may contain `text`, `error`, and optional `screenshot` metadata/data. Late, duplicate, and unknown IDs are ignored after cancellation or timeout. |
 | `set_notes_control` | `enabled: boolean` | Advertises the native Notes broker. `notes_read` and `notes_update` enter model schemas only while true; read-only routes receive only `notes_read`. The native app, not the model, resolves the workspace/chat owner and current scope. Rejected while a turn is busy. |
 | `notes_action_result` | `request_id: string`, `result: object` | Completes one pending Notes request. `result` contains `text` or `error`; late, duplicate, and unknown IDs are ignored after cancellation or timeout. |
+| `set_wallet_control` | `enabled: boolean` | Advertises a live native Locus Vault policy gateway. Wallet schemas remain absent in headless mode and until the native signer says it is available. Rejected while a turn is busy. |
+| `wallet_action_result` | `request_id: string`, `result: object` | Completes one pending wallet request. `result` contains `text` or `error`; late, duplicate, and unknown IDs are ignored after cancellation or timeout. Native policy remains authoritative regardless of agent permission mode. |
 | `set_model` | `model: string` | Switches model (substring match allowed). Emits `session_info` on success, `command_error` if rejected. Persisted to config. |
 | `set_cwd` | `path: string` | Changes the agent working directory. Emits `session_info` on success, `command_error` otherwise. |
 | `set_permission_mode` | `mode: "ask" \| "accept_edits" \| "bypass"` | Changes the permission mode while idle and emits `session_info`. |
@@ -647,12 +692,14 @@ Endpoint: `/ws/chat`.
 | `resume` | `session_id: string` | Resumes a saved session. Ends with `slash_result {command: "resume", data: {messages: [...]}}`. Rejected when busy. |
 | `ping` | — | Emits `pong`; used as an ordering sentinel. |
 
-An ordinary Solo Work, Plan, or Build `user_message` may include
-`solo_swarm: {"enabled": true}`. The backend snapshots the selected route and
-temporarily exposes one bounded `delegate_read_only` tool to the visible root.
+Every ordinary Solo Work, Plan, or Build `user_message` enables adaptive
+delegation. The deprecated `solo_swarm: {"enabled": true}` field remains
+accepted for older clients but is no longer required. The backend snapshots
+the selected route and temporarily exposes one bounded `delegate_read_only`
+tool to the visible root.
 Workers use the same provider/model, remain depth-one and workspace-read-only,
 and emit the existing agent activity plus `swarm_telemetry` events. Ask, slash,
-and team messages reject the field. `run_kind` remains `solo`.
+and team messages never expose delegation. `run_kind` remains `solo`.
 
 A team budget may include `call_budget_mode: "automatic" | "fixed"`.
 `automatic` resolves to the bounded 100-call adaptive pool; `fixed` preserves
@@ -778,8 +825,10 @@ for the session.
 
 ### `browser_control_status` / `browser_action_request`
 
-`browser_control_status {enabled}` acknowledges the browser capability
-handshake. When enabled, a browser tool call emits:
+`browser_control_status {enabled, history_enabled}` acknowledges the browser
+capability handshake. `history_enabled` is true only when the broker is live
+and the user has separately enabled agent access to history. When enabled, a
+browser tool call emits:
 
 ```json
 { "type": "browser_action_request", "request_id": "...",
@@ -827,6 +876,26 @@ read-only schemas. Requests never contain a workspace path or scope. The native
 app derives both from the requesting socket/session and its saved Workspace or
 Each chat setting, then answers background workers without changing the
 foreground chat.
+
+### `wallet_control_status` / `wallet_action_request`
+
+`wallet_control_status {enabled}` acknowledges a live native Locus Vault
+gateway. When enabled, a wallet tool call emits:
+
+```json
+{ "type": "wallet_action_request", "request_id": "...",
+  "tool": "wallet_prepare_transaction",
+  "arguments": {"chain": "evm", "amount": "1.0"},
+  "timeout_ms": 60000, "session_id": "..." }
+```
+
+The worker accepts exactly one matching `wallet_action_result`, times out after
+60 seconds, and cancels pending requests on interrupt, orchestration
+cancellation, or socket teardown. Capability advertisement and direct lookup
+both fail closed when the gateway is absent. Read-only routes receive only
+account, balance, and activity queries. Preparing, simulating, or executing a
+transaction remains subject to the independent native policy gateway; Bypass
+mode cannot approve or weaken wallet policy.
 
 ### Team orchestration and scheduler events
 
@@ -1111,6 +1180,19 @@ without passing through `read_file`'s workspace scoping or its prompt. Typing a
 credential is hard blocked on both sides — by content in the agent, and by the
 field's own type, its autocomplete hint, and whether its form holds a password
 in the app.
+
+When separately enabled, `browser_history` returns only URL, title, and visit
+time through a bounded, paginated search. It never returns page content,
+autofill data, or credential/payment fields, and a guessed call is rejected at
+lookup time when history access is off.
+
+When a live Locus Vault gateway is enabled the schema also contains
+`wallet_list_accounts`, `wallet_get_balance`, `wallet_get_activity`,
+`wallet_prepare_transaction`, `wallet_simulate_transaction`,
+`wallet_execute_transaction`, and `wallet_lock`. The first three remain
+available to read-only agents. All transaction authority stays behind the
+native policy gateway, which rechecks decoded intent, network, budget, expiry,
+nonce, and simulation state and never exposes key or recovery material.
 
 JavaScript dialogs never block the page: alerts are acknowledged, and an
 unarmed `confirm`/`prompt` takes the safe branch — dismissed — with the outcome
