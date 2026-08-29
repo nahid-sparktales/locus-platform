@@ -27,6 +27,7 @@ from ollama_code import config as config_mod
 from ollama_code import core as core_module
 from ollama_code import server as server_mod
 from ollama_code import sessions as sessions_mod
+from ollama_code.chat_transport_runtime import event_pump
 from ollama_code.continuity import ContinuityStore
 from ollama_code.core import AgentCore
 from ollama_code.ollama import ChatResponse, OllamaError, process_chunk
@@ -54,10 +55,12 @@ def ctx(tmp_path):
 
 
 def test_context_and_observation_settings_endpoints(client, tmp_path, monkeypatch):
+    from ollama_code.api import continuity as continuity_api
+
     workspace = client.app.state.service.core.workspace_root \
         or client.app.state.service.core.cwd
     store = ContinuityStore(tmp_path / "continuity.sqlite3", key=b"e" * 32)
-    monkeypatch.setattr(server_mod, "_continuity_store", lambda: store)
+    monkeypatch.setattr(continuity_api, "_continuity_store", lambda: store)
     snapshot = store.save_snapshot(
         workspace, "session-endpoint", {"goal": "preserve context"}
     )
@@ -1734,8 +1737,10 @@ def client(tmp_path, monkeypatch):
         {"name": "test-model", "context_length": 32768},
     ])
     core.messages = [core.system_message()]
-    server_mod.app.state.service = server_mod.ChatService(core)
-    with TestClient(server_mod.app) as c:
+    test_app = server_mod.create_app(
+        chat_service=server_mod.ChatService(core)
+    )
+    with TestClient(test_app) as c:
         yield c
 
 
@@ -1747,6 +1752,110 @@ def test_health_and_models(client):
     assert models["models"][0]["name"] == "test-model"
     assert models["models"][0]["context_length"] == 32768
     assert models["current"] == "test-model"
+
+
+def test_evaluation_crud_routes_preserve_suite_contract(client, tmp_path):
+    payload = {
+        "name": "Read-only smoke",
+        "workspace_root": str(tmp_path),
+        "tags": ["smoke"],
+        "cases": [
+            {
+                "id": "case-1",
+                "name": "Inspect",
+                "prompt": "Inspect the fixture without editing it.",
+                "mode": "read_only",
+                "target": "solo",
+                "assertions": [
+                    {"kind": "output_contains", "value": "ready", "required": True}
+                ],
+            }
+        ],
+    }
+
+    created = client.post("/api/evaluations", json=payload)
+    assert created.status_code == 200
+    suite = created.json()["suite"]
+    suite_id = suite["id"]
+
+    listed = client.get("/api/evaluations", params={"workspace": str(tmp_path)})
+    assert [item["id"] for item in listed.json()["suites"]] == [suite_id]
+    detail = client.get(f"/api/evaluations/{suite_id}").json()
+    assert detail["suite"]["name"] == "Read-only smoke"
+    assert detail["results"] == []
+    assert client.get(
+        f"/api/evaluations/{suite_id}/comparison"
+    ).json()["configurations"] == []
+    assert client.get(
+        f"/api/evaluations/{suite_id}/export"
+    ).json()["suite"]["id"] == suite_id
+
+    suite["name"] = "Updated smoke"
+    updated = client.put(f"/api/evaluations/{suite_id}", json=suite)
+    assert updated.json()["suite"]["name"] == "Updated smoke"
+    assert client.delete(f"/api/evaluations/{suite_id}").json() == {
+        "ok": True,
+        "id": suite_id,
+    }
+    assert client.get(f"/api/evaluations/{suite_id}").status_code == 404
+
+
+def test_evaluation_execution_routes_use_feature_runtime_and_app_runner(
+    client, tmp_path, monkeypatch,
+):
+    from ollama_code.evaluation_runtime import run_evaluation_suite
+
+    payload = {
+        "name": "Team smoke",
+        "workspace_root": str(tmp_path),
+        "cases": [
+            {
+                "id": "case-1",
+                "name": "Inspect",
+                "prompt": "Inspect the fixture.",
+                "mode": "read_only",
+                "target": "team",
+                "assertions": [],
+            }
+        ],
+    }
+    suite_id = client.post("/api/evaluations", json=payload).json()["suite"]["id"]
+    service = client.app.state.service
+    queued: dict[str, object] = {}
+
+    def start_turn(loop, call, *args):
+        queued.update({"loop": loop, "call": call, "args": args})
+        return True
+
+    monkeypatch.setattr(service, "start_turn", start_turn)
+    response = client.post(
+        f"/api/evaluations/{suite_id}/run",
+        json={"manifest": {}},
+    )
+
+    assert response.status_code == 200
+    evaluation_id = response.json()["evaluation_id"]
+    assert queued["call"] is run_evaluation_suite
+    args = queued["args"]
+    assert isinstance(args, tuple)
+    assert args[0] is service
+    assert args[4] == evaluation_id
+    assert args[5] is client.app.state.evaluation_team_runner
+
+    interrupted: list[bool] = []
+    service.active_evaluation_id = evaluation_id
+    service.active_evaluation_core = SimpleNamespace(
+        interrupt=lambda: interrupted.append(True)
+    )
+    cancelled = client.post(f"/api/evaluations/runs/{evaluation_id}/cancel")
+
+    assert cancelled.json() == {
+        "ok": True,
+        "evaluation_id": evaluation_id,
+        "state": "cancelling",
+    }
+    assert service.core._interrupt.is_set()
+    assert interrupted == [True]
 
 
 def test_schedule_crud_and_manual_dispatch_preserve_foreground_chat(client, tmp_path):
@@ -2869,6 +2978,37 @@ def test_websocket_agentic_modes_route_image_attachments(client, monkeypatch):
         assert args[3][0]["data"] == "cG5n"
 
 
+def test_websocket_routes_cited_research_without_enabling_tools(client, monkeypatch):
+    service = client.app.state.service
+    captured = []
+    monkeypatch.setattr(
+        service,
+        "start_turn",
+        lambda _loop, call, *args: captured.append((call, args)) or True,
+    )
+
+    asyncio.run(server_mod._handle_client_message(service, {
+        "type": "research_board_request",
+        "request_id": "research-1",
+        "prompt": "Compare the evidence",
+        "format": "comparison",
+        "sources": [{
+            "source_id": "source-1",
+            "tab_id": "tab-1",
+            "title": "Example",
+            "url": "https://example.com/article",
+            "captured_at": "2026-08-24T12:00:00.000Z",
+            "content_hash": "a" * 64,
+            "passages": [{"passage_id": "p1", "text": "The result was 42."}],
+        }],
+    }))
+
+    call, args = captured[0]
+    assert call is server_mod._run_research_request
+    assert args[0] is service
+    assert args[1]["sources"][0]["passages"][0]["passage_id"] == "p1"
+
+
 def test_websocket_routes_bounded_live_browser_context(client, monkeypatch):
     service = client.app.state.service
     captured = []
@@ -3308,6 +3448,81 @@ def test_native_computer_tool_uses_permission_mode_and_bridge(tmp_path):
     assert calls[0][1]["element"] == "snap-1"
 
 
+def test_simulator_tools_require_native_attachment_and_respect_read_only_routes(tmp_path):
+    core = _core(tmp_path, [ChatResponse(content_parts=["ok"], done=True)])
+
+    def names():
+        return {schema["function"]["name"] for schema in core.tool_registry.schemas()}
+
+    assert "simulator_get_state" not in names()
+    core.tool_registry.simulator_enabled = True
+    assert {
+        "simulator_get_state", "simulator_tap", "simulator_build_and_launch",
+        "simulator_screenshot",
+    } <= names()
+
+    core.tool_registry.set_mcp_agent_policy(
+        {}, access_ceiling="read_only", role="reviewer",
+    )
+    assert {
+        "simulator_list_devices", "simulator_get_state", "simulator_screenshot",
+    } <= names()
+    assert "simulator_tap" not in names()
+    assert core.tool_registry.simulator_tool_allowed("simulator_get_state")
+    assert not core.tool_registry.simulator_tool_allowed("simulator_type_text")
+
+
+def test_native_simulator_tool_uses_dedicated_bridge(tmp_path):
+    from ollama_code.ollama import ToolCall
+
+    responses = [
+        ChatResponse(tool_calls=[ToolCall("simulator_tap", {"x": 10, "y": 20})], done=True),
+        ChatResponse(content_parts=["done"], done=True),
+    ]
+    core = _core(tmp_path, responses)
+    core.tool_registry.simulator_enabled = True
+    core.perms.set_mode("bypass")
+    calls = []
+    core.simulator_executor = lambda name, args, request_id: (
+        calls.append((name, args, request_id)) or "tapped"
+    )
+
+    core.run_turn("tap the simulator")
+
+    assert calls and calls[0][0] == "simulator_tap"
+    assert calls[0][1] == {"x": 10, "y": 20}
+
+
+def test_simulator_capability_websocket_requires_attached_device(client):
+    svc = client.app.state.service
+    with client.websocket_connect("/ws/chat") as ws:
+        ws.receive_json()
+        ws.send_json({
+            "type": "set_simulator_control",
+            "enabled": True,
+            "native_available": True,
+        })
+        status = next(
+            event for event in drain(ws)
+            if event["type"] == "simulator_control_status"
+        )
+        assert status["enabled"] is False
+        assert not svc.core.tool_registry.simulator_enabled
+
+        ws.send_json({
+            "type": "set_simulator_control",
+            "enabled": True,
+            "native_available": True,
+            "attached_device": {"udid": "SIM-1", "name": "iPad Pro"},
+        })
+        status = next(
+            event for event in drain(ws)
+            if event["type"] == "simulator_control_status"
+        )
+        assert status["enabled"] is True
+        assert svc.core.tool_registry.simulator_enabled
+
+
 def test_browser_tools_are_absent_until_the_app_announces_a_broker(tmp_path):
     core = _core(tmp_path, [ChatResponse(content_parts=["ok"], done=True)])
 
@@ -3321,6 +3536,94 @@ def test_browser_tools_are_absent_until_the_app_announces_a_broker(tmp_path):
 
     core.tool_registry.browser_enabled = True
     assert {"browser_read_page", "browser_navigate"} <= names()
+    assert "browser_history" not in names()
+
+
+def test_browser_history_requires_its_separate_opt_in_at_schema_and_dispatch(tmp_path):
+    from ollama_code.ollama import ToolCall
+
+    responses = [
+        ChatResponse(tool_calls=[ToolCall("browser_history", {"query": "docs"})], done=True),
+        ChatResponse(content_parts=["done"], done=True),
+    ]
+    core = _core(tmp_path, responses)
+    core.tool_registry.browser_enabled = True
+    calls = []
+    core.browser_executor = lambda name, args, request_id: calls.append(name) or "history"
+
+    assert not core.tool_registry.browser_tool_allowed("browser_history")
+    assert "browser_history" not in {
+        schema["function"]["name"] for schema in core.tool_registry.schemas()
+    }
+    core.perms.set_mode("bypass")
+    core.run_turn("search browser history")
+    assert calls == []
+
+    core.tool_registry.browser_history_enabled = True
+    assert core.tool_registry.browser_tool_allowed("browser_history")
+    assert "browser_history" in {
+        schema["function"]["name"] for schema in core.tool_registry.schemas()
+    }
+
+
+def test_browser_history_is_read_only_when_enabled(tmp_path):
+    core = _core(tmp_path, [ChatResponse(content_parts=["ok"], done=True)])
+    core.tool_registry.browser_enabled = True
+    core.tool_registry.browser_history_enabled = True
+    core.tool_registry.set_mcp_agent_policy({}, access_ceiling="read_only", role="reviewer")
+
+    assert core.tool_registry.browser_tool_allowed("browser_history")
+    assert core.tool_registry.is_safe("browser_history")
+
+
+def test_browser_autofill_schema_is_category_gated_and_hidden_from_read_only_agents(tmp_path):
+    core = _core(tmp_path, [ChatResponse(content_parts=["ok"], done=True)])
+    core.tool_registry.browser_enabled = True
+
+    def browser_schemas():
+        return {
+            schema["function"]["name"]: schema
+            for schema in core.tool_registry.browser_schemas()
+        }
+
+    assert "browser_autofill" not in browser_schemas()
+
+    core.tool_registry.browser_autofill_categories = {"contact", "paymentCard"}
+    schema = browser_schemas()["browser_autofill"]
+    category = schema["function"]["parameters"]["properties"]["category"]
+    assert category["enum"] == ["contact", "paymentCard"]
+    assert core.tool_registry.browser_tool_allowed("browser_autofill")
+
+    core.tool_registry.set_mcp_agent_policy(
+        {}, access_ceiling="read_only", role="reviewer"
+    )
+    assert "browser_autofill" not in browser_schemas()
+    assert not core.tool_registry.browser_tool_allowed("browser_autofill")
+
+
+def test_guessing_disabled_browser_autofill_never_reaches_the_native_broker(tmp_path):
+    from ollama_code.ollama import ToolCall
+
+    responses = [
+        ChatResponse(
+            tool_calls=[ToolCall("browser_autofill", {
+                "action": "get",
+                "category": "password",
+                "record_id": "guessed",
+            })],
+            done=True,
+        ),
+        ChatResponse(content_parts=["done"], done=True),
+    ]
+    core = _core(tmp_path, responses)
+    core.tool_registry.browser_enabled = True
+    core.perms.set_mode("bypass")
+    calls = []
+    core.browser_executor = lambda name, args, request_id: calls.append(name) or "secret"
+
+    core.run_turn("use my saved password")
+
+    assert calls == []
 
 
 def test_read_only_agents_see_and_may_use_only_the_reading_half(tmp_path):
@@ -3340,7 +3643,7 @@ def test_read_only_agents_see_and_may_use_only_the_reading_half(tmp_path):
     assert not core.tool_registry.browser_tool_allowed("browser_navigate")
 
 
-def test_read_only_agent_guessing_a_mutating_browser_tool_is_undiscoverable(tmp_path):
+def test_read_only_agent_guessing_a_mutating_browser_tool_is_refused(tmp_path):
     from ollama_code.ollama import ToolCall
 
     responses = [
@@ -3360,7 +3663,7 @@ def test_read_only_agent_guessing_a_mutating_browser_tool_is_undiscoverable(tmp_
 
     assert calls == []
     results = [event for event in events if event["type"] == "tool_result"]
-    assert results and "unknown tool 'browser_navigate'" in results[0]["result"]
+    assert results and "read-only" in results[0]["result"]
 
 
 def test_browser_tool_reaches_the_browser_bridge(tmp_path):
@@ -3428,7 +3731,17 @@ def test_wallet_tools_require_a_native_signer_and_keep_read_only_agents_read_onl
     assert core.tool_registry.wallet_enabled is False
     assert "wallet_list_accounts" not in names()
 
-    core.tool_registry.wallet_enabled = True
+    assert core.tool_registry.configure_wallet_capability({
+        "protocol_version": 1,
+        "signer_state": "unlocked",
+        "session_id": "session-1",
+        "supported_chains": ["eip155:11155111"],
+        "allowed_operations": [
+            "wallet_list_accounts", "wallet_get_balance", "wallet_get_activity",
+            "wallet_prepare_transaction", "wallet_simulate_transaction",
+            "wallet_execute_transaction", "wallet_lock",
+        ],
+    })
     assert {"wallet_list_accounts", "wallet_prepare_transaction", "wallet_execute_transaction"} <= names()
 
     core.tool_registry.set_mcp_agent_policy({}, access_ceiling="read_only", role="reviewer")
@@ -3446,36 +3759,19 @@ def test_wallet_tool_reaches_the_native_policy_bridge(tmp_path):
         ChatResponse(content_parts=["done"], done=True),
     ]
     core = _core(tmp_path, responses)
-    core.tool_registry.wallet_enabled = True
+    core.tool_registry.configure_wallet_capability({
+        "protocol_version": 1,
+        "signer_state": "unlocked",
+        "session_id": "session-1",
+        "supported_chains": ["eip155:11155111"],
+        "allowed_operations": ["wallet_list_accounts"],
+    })
     calls = []
     core.wallet_executor = lambda name, args, request_id: calls.append((name, args)) or "account-1"
 
     core.run_turn("list my Locus Vault accounts")
 
     assert calls == [("wallet_list_accounts", {})]
-
-
-def test_read_only_agent_guessing_a_mutating_wallet_tool_is_undiscoverable(tmp_path):
-    from ollama_code.ollama import ToolCall
-
-    responses = [
-        ChatResponse(tool_calls=[ToolCall("wallet_execute_transaction", {"intent_id": "intent-1"})], done=True),
-        ChatResponse(content_parts=["done"], done=True),
-    ]
-    core = _core(tmp_path, responses)
-    core.tool_registry.wallet_enabled = True
-    core.tool_registry.set_mcp_agent_policy({}, access_ceiling="read_only", role="reviewer")
-    core.perms.set_mode("bypass")
-    calls = []
-    core.wallet_executor = lambda name, args, request_id: calls.append(name) or "executed"
-
-    events = []
-    core.on_event(events.append)
-    core.run_turn("execute the prepared transaction")
-
-    assert calls == []
-    results = [event for event in events if event["type"] == "tool_result"]
-    assert results and "unknown tool 'wallet_execute_transaction'" in results[0]["result"]
 
 
 def test_notes_tool_reaches_the_native_bridge(tmp_path):
@@ -3574,12 +3870,18 @@ def test_browsing_ordinary_urls_is_neither_blocked_nor_confirmation_gated():
 
 def test_browser_guardrails_hold_where_the_arguments_carry_meaning():
     perms = PermissionManager(mode="bypass")
+    # Native browser input is gated against the actual field category and the
+    # live Autofill settings. Text scanning here would falsely reject enabled
+    # passwords whose values happen to contain a word such as "secret".
     assert perms.blocked_reason(
         "browser_input", {"action": "type", "text": "my password is hunter2"}
-    ) is not None
+    ) is None
     assert perms.blocked_reason(
         "browser_input", {"action": "type", "text": "hello world"}
     ) is None
+    assert perms.blocked_reason(
+        "browser_javascript", {"code": "password.value = 'hunter2'"}
+    ) is not None
     # Reading the page is never blocked, however the query is phrased.
     assert perms.blocked_reason("browser_read_page", {"ref_id": "ref_7"}) is None
     # These are marked as consequential for Ask/Accept Edits; AgentCore skips
@@ -3604,13 +3906,13 @@ def test_browser_permission_preview_names_a_coordinate_target():
     assert build_preview("browser_input", {"action": "click", "ref": "ref_4"})[0] == "click ref_4"
 
 
-def test_coordinate_input_still_meets_the_credential_gate():
+def test_coordinate_input_defers_credential_authority_to_the_native_field_gate():
     from ollama_code.permissions import PermissionManager as Manager
 
     manager = Manager(mode="bypass")
-    # Aiming by pixels rather than by ref must not route around the block on
-    # typing credentials, which reads the typed text, not the target.
-    assert manager.blocked_reason(
+    # The backend cannot tell what pixels mean. The native broker classifies
+    # the focused field and checks current password/card grants before typing.
+    assert not manager.blocked_reason(
         "browser_input",
         {"action": "type", "x": 10, "y": 20, "text": "my password is hunter2"},
     )
@@ -3898,10 +4200,26 @@ def test_dev_server_tool_never_crosses_the_socket(client):
     # without any native broker attached.
     with client.websocket_connect("/ws/chat") as ws:
         assert ws.receive_json()["type"] == "session_info"
-        ws.send_json({"type": "set_browser_control", "enabled": True})
+        ws.send_json({
+            "type": "set_browser_control",
+            "enabled": True,
+            "history_enabled": True,
+            "autofill_categories": ["password", "paymentCard", "invalid"],
+        })
         events = drain(ws)
-        assert {"type": "browser_control_status", "enabled": True} in [
-            {"type": e.get("type"), "enabled": e.get("enabled")} for e in events
+        assert {
+            "type": "browser_control_status",
+            "enabled": True,
+            "history_enabled": True,
+            "autofill_categories": ["password", "paymentCard"],
+        } in [
+            {
+                "type": e.get("type"),
+                "enabled": e.get("enabled"),
+                "history_enabled": e.get("history_enabled"),
+                "autofill_categories": e.get("autofill_categories"),
+            }
+            for e in events
         ]
 
     svc = client.app.state.service
@@ -3953,7 +4271,16 @@ def test_notes_bridge_round_trips_one_result_per_request(client):
 def test_wallet_bridge_round_trips_only_after_the_native_capability_is_enabled(client):
     with client.websocket_connect("/ws/chat") as ws:
         assert ws.receive_json()["type"] == "session_info"
-        ws.send_json({"type": "set_wallet_control", "enabled": True})
+        ws.send_json({
+            "type": "set_wallet_control",
+            "capability": {
+                "protocol_version": 1,
+                "signer_state": "unlocked",
+                "session_id": "native-session-1",
+                "supported_chains": ["eip155:11155111"],
+                "allowed_operations": ["wallet_list_accounts"],
+            },
+        })
         events = drain(ws)
         assert {"type": "wallet_control_status", "enabled": True} in [
             {"type": event.get("type"), "enabled": event.get("enabled")}
@@ -3987,6 +4314,33 @@ def test_wallet_bridge_round_trips_only_after_the_native_capability_is_enabled(c
             "result": {"text": "duplicate"},
         })
         assert drain(ws) == []
+
+
+def test_wallet_capability_rejects_stale_boolean_and_limits_operations(client):
+    with client.websocket_connect("/ws/chat") as ws:
+        assert ws.receive_json()["type"] == "session_info"
+        ws.send_json({"type": "set_wallet_control", "enabled": True})
+        events = drain(ws)
+        assert any(
+            event.get("type") == "wallet_control_status" and event.get("enabled") is False
+            for event in events
+        )
+        registry = client.app.state.service.core.tool_registry
+        assert not registry.wallet_enabled
+
+        ws.send_json({
+            "type": "set_wallet_control",
+            "capability": {
+                "protocol_version": 1,
+                "signer_state": "unlocked",
+                "session_id": "native-session-2",
+                "supported_chains": ["eip155:11155111"],
+                "allowed_operations": ["wallet_list_accounts"],
+            },
+        })
+        drain(ws)
+        assert registry.wallet_tool_allowed("wallet_list_accounts")
+        assert not registry.wallet_tool_allowed("wallet_execute_transaction")
 
 
 def test_dev_server_permission_posture():
@@ -4617,7 +4971,7 @@ def test_terminal_event_is_not_sent_until_turn_slot_is_idle(tmp_path):
                 self.events.append(event)
 
         socket = Socket()
-        pump = asyncio.create_task(server_mod._event_pump(service, socket))
+        pump = asyncio.create_task(event_pump(service, socket))
         service.queue_event({"type": "turn_done", "reason": "interrupted"})
         await asyncio.sleep(0)
         assert socket.events == []

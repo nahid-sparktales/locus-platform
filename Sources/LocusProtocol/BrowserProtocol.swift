@@ -4,6 +4,7 @@ import Foundation
 
 public enum BrowserToolName: String, Codable, CaseIterable, Sendable {
     case history = "browser_history"
+    case autofill = "browser_autofill"
     case readPage = "browser_read_page"
     case getText = "browser_get_text"
     case find = "browser_find"
@@ -19,18 +20,30 @@ public enum BrowserToolName: String, Codable, CaseIterable, Sendable {
     case devServer = "browser_dev_server"
 }
 
+public enum BrowserAutofillCategory: String, Codable, CaseIterable, Sendable {
+    case password, contact, paymentCard
+}
+
 public struct SetBrowserControl: Codable, Equatable, Sendable {
     public let type: String
     public let enabled: Bool
     public let historyEnabled: Bool?
+    public let autofillCategories: [BrowserAutofillCategory]?
 
-    public init(enabled: Bool, historyEnabled: Bool? = nil) {
+    public init(
+        enabled: Bool,
+        historyEnabled: Bool? = nil,
+        autofillCategories: [BrowserAutofillCategory]? = nil
+    ) {
         self.type = "set_browser_control"; self.enabled = enabled
         self.historyEnabled = historyEnabled
+        self.autofillCategories = autofillCategories
     }
 
     private enum CodingKeys: String, CodingKey {
-        case type, enabled; case historyEnabled = "history_enabled"
+        case type, enabled
+        case historyEnabled = "history_enabled"
+        case autofillCategories = "autofill_categories"
     }
 }
 
@@ -148,12 +161,46 @@ public enum WalletToolName: String, Codable, CaseIterable, Sendable {
     case lock = "wallet_lock"
 }
 
+public struct WalletCapability: Codable, Equatable, Sendable {
+    public let protocolVersion: Int
+    public let signerState: String
+    public let sessionId: String
+    public let supportedChains: [String]
+    public let allowedOperations: [WalletToolName]
+
+    public init(
+        sessionId: String,
+        supportedChains: [String],
+        allowedOperations: [WalletToolName]
+    ) {
+        self.protocolVersion = 1
+        self.signerState = "unlocked"
+        self.sessionId = sessionId
+        self.supportedChains = supportedChains
+        self.allowedOperations = allowedOperations
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case signerState = "signer_state"
+        case sessionId = "session_id"
+        case supportedChains = "supported_chains"
+        case allowedOperations = "allowed_operations"
+    }
+}
+
 public struct SetWalletControl: Codable, Equatable, Sendable {
     public let type: String
-    public let enabled: Bool
+    public let capability: WalletCapability?
+    public let enabled: Bool?
 
+    public init(capability: WalletCapability?) {
+        self.type = "set_wallet_control"; self.capability = capability; self.enabled = nil
+    }
+
+    @available(*, deprecated, message: "A validated signer capability is required to enable wallet tools")
     public init(enabled: Bool) {
-        self.type = "set_wallet_control"; self.enabled = enabled
+        self.type = "set_wallet_control"; self.capability = nil; self.enabled = enabled
     }
 }
 

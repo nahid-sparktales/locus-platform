@@ -4,6 +4,7 @@ export const protocolVersion = 1 as const;
 
 export const browserToolNames = [
   "browser_history",
+  "browser_autofill",
   "browser_read_page",
   "browser_get_text",
   "browser_find",
@@ -21,6 +22,11 @@ export const browserToolNames = [
 
 export const BrowserToolNameSchema = z.enum(browserToolNames);
 export type BrowserToolName = z.infer<typeof BrowserToolNameSchema>;
+
+export const BrowserAutofillCategorySchema = z.enum([
+  "password", "contact", "paymentCard",
+]);
+export type BrowserAutofillCategory = z.infer<typeof BrowserAutofillCategorySchema>;
 
 export const TabAccessLevelSchema = z.enum(["read", "interact"]);
 export const TabAccessSourceSchema = z.enum(["user_share", "agent_created"]);
@@ -41,6 +47,7 @@ export const SetBrowserControlSchema = z.object({
   type: z.literal("set_browser_control"),
   enabled: z.boolean(),
   history_enabled: z.boolean().optional(),
+  autofill_categories: z.array(BrowserAutofillCategorySchema).optional(),
 });
 
 export const BrowserActionRequestSchema = z.object({
@@ -95,9 +102,21 @@ export const walletToolNames = [
 export const WalletToolNameSchema = z.enum(walletToolNames);
 export type WalletToolName = z.infer<typeof WalletToolNameSchema>;
 
+export const WalletCapabilitySchema = z.object({
+  protocol_version: z.literal(1),
+  signer_state: z.literal("unlocked"),
+  session_id: z.string().min(1),
+  supported_chains: z.array(z.string().regex(/^[^:]+:.+$/)).min(1),
+  allowed_operations: z.array(WalletToolNameSchema).min(1),
+});
+export type WalletCapability = z.infer<typeof WalletCapabilitySchema>;
+
 export const SetWalletControlSchema = z.object({
   type: z.literal("set_wallet_control"),
-  enabled: z.boolean(),
+  capability: WalletCapabilitySchema.nullish(),
+  // Kept only so v1 clients decode cleanly. The runtime treats this field as
+  // fail-closed and never enables wallet tools without a validated capability.
+  enabled: z.boolean().optional(),
 });
 
 export const WalletActionRequestSchema = z.object({

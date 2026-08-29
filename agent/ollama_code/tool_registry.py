@@ -1,6 +1,7 @@
 """Dynamic tool schemas and dispatch for built-ins, skills, and MCP tools."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -33,6 +34,16 @@ _WORKSPACE_READ_TOOLS = {
 }
 _WORKSPACE_WRITE_TOOLS = {"write_file", "edit_file", "multi_edit", "apply_patch", "notes_update"}
 _SHELL_TOOLS = {"bash", "background_service"}
+_READ_ONLY_BUILTIN_TOOLS = {
+    *_WORKSPACE_READ_TOOLS,
+    *_SAFE_EXTENSION_TOOLS,
+    "search_memory",
+    "web_fetch",
+}
+_PARALLEL_SAFE_BUILTIN_TOOLS = {
+    "read_file", "glob", "grep", "list_dir", "git_status", "git_diff",
+    "search_workspace_knowledge", "search_memory", "web_fetch", "read_skill_file",
+}
 
 
 def _base_schemas(access_ceiling: str = "workspace_write") -> list[dict[str, Any]]:
@@ -313,6 +324,95 @@ _COMPUTER_TOOL_NAMES = {
     schema["function"]["name"] for schema in COMPUTER_TOOL_SCHEMAS
 }
 
+SIMULATOR_TOOL_SCHEMAS = [
+    _schema(
+        "simulator_list_devices",
+        "List installed iPhone and iPad simulators. Booted devices are first. Read-only.",
+        {},
+        [],
+    ),
+    _schema(
+        "simulator_attach",
+        "Confirm the simulator explicitly attached to this task. It cannot select or replace a device.",
+        {"udid": {"type": "string", "description": "The already attached simulator UDID."}},
+        ["udid"],
+    ),
+    _schema(
+        "simulator_get_state",
+        "Inspect the attached simulator's dimensions and bounded accessibility tree. Element ids expire after every UI mutation.",
+        {"include_screenshot": {"type": "boolean", "description": "Also request the newest screenshot when route and provider consent allow images."}},
+        [],
+    ),
+    _schema(
+        "simulator_tap",
+        "Tap an element from the latest state or a point in device coordinates.",
+        {
+            "element": {"type": "string", "description": "Expiring element id from simulator_get_state."},
+            "x": {"type": "number"},
+            "y": {"type": "number"},
+        },
+        [],
+    ),
+    _schema(
+        "simulator_swipe",
+        "Swipe between two points in attached-device coordinates.",
+        {
+            "from_x": {"type": "number"}, "from_y": {"type": "number"},
+            "to_x": {"type": "number"}, "to_y": {"type": "number"},
+            "duration_ms": {"type": "integer", "minimum": 50, "maximum": 5000},
+        },
+        ["from_x", "from_y", "to_x", "to_y"],
+    ),
+    _schema(
+        "simulator_type_text",
+        "Type text into the focused simulator field without moving the Mac pointer.",
+        {"text": {"type": "string", "maxLength": 20000}},
+        ["text"],
+    ),
+    _schema(
+        "simulator_press_button",
+        "Press a Simulator device control.",
+        {"button": {"type": "string", "enum": ["home", "lock", "volume_up", "volume_down", "rotate_left", "rotate_right"]}},
+        ["button"],
+    ),
+    _schema(
+        "simulator_open_url",
+        "Open an absolute HTTP or HTTPS URL on the attached simulator.",
+        {"url": {"type": "string"}},
+        ["url"],
+    ),
+    _schema(
+        "simulator_build_and_launch",
+        "Build, install, and launch an Xcode project on the attached simulator. Always targets its leased UDID and returns structured build details.",
+        {
+            "project": {"type": "string", "description": "Workspace-relative .xcodeproj path."},
+            "workspace": {"type": "string", "description": "Workspace-relative .xcworkspace path."},
+            "scheme": {"type": "string"},
+            "configuration": {"type": "string"},
+        },
+        [],
+    ),
+    _schema(
+        "simulator_screenshot",
+        "Capture the attached simulator in the shared visual-observation slot. Read-only.",
+        {},
+        [],
+    ),
+    _schema(
+        "simulator_detach",
+        "Detach this task without shutting down or erasing the simulator.",
+        {},
+        [],
+    ),
+]
+
+_READ_ONLY_SIMULATOR_TOOLS = {
+    "simulator_list_devices", "simulator_get_state", "simulator_screenshot",
+}
+_SIMULATOR_TOOL_NAMES = {
+    schema["function"]["name"] for schema in SIMULATOR_TOOL_SCHEMAS
+}
+
 #: The one wording for a retired element id. Repeated verbatim in
 #: ``BrowserBridge.staleReferenceMessage`` on the Swift side and asserted in both
 #: test suites, so what the model is told to expect and what it actually gets
@@ -348,6 +448,25 @@ BROWSER_TOOL_SCHEMAS = [
             "limit": {"type": "integer", "minimum": 1, "maximum": 100},
         },
         [],
+    ),
+    _browser_schema(
+        "browser_autofill",
+        "List, retrieve, or fill browser data that the user explicitly enabled for the "
+        "active model. 'get' returns raw saved values. Password records are limited to "
+        "the open tab's exact origin; contact and payment-card records are global. "
+        "Security codes are never stored.",
+        {
+            "action": {"type": "string", "enum": ["list", "get", "fill"]},
+            "category": {
+                "type": "string",
+                "enum": ["password", "contact", "paymentCard"],
+            },
+            "record_id": {
+                "type": "string",
+                "description": "For get or fill, an id returned by list.",
+            },
+        },
+        ["action", "category"],
     ),
     _browser_schema(
         "browser_read_page",
@@ -596,32 +715,58 @@ WALLET_TOOL_SCHEMAS = [
     _schema(
         "wallet_get_balance",
         "Read balances for one public Locus Vault account.",
-        {"account_id": {"type": "string"}, "network": {"type": "string"}},
-        ["account_id"],
+        {"account_id": {"type": "string"}, "network_id": {"type": "string"}},
+        ["account_id", "network_id"],
     ),
     _schema(
         "wallet_get_activity",
         "Read recent on-chain activity for one public Locus Vault account.",
-        {"account_id": {"type": "string"}, "network": {"type": "string"}, "limit": {"type": "integer"}},
-        ["account_id"],
+        {"account_id": {"type": "string"}, "network_id": {"type": "string"}, "limit": {"type": "integer"}},
+        ["account_id", "network_id"],
     ),
     _schema(
         "wallet_prepare_transaction",
-        "Prepare and policy-check one decoded transaction without exposing key material. Mainnet requires an active session budget.",
+        "Prepare one semantic transaction without exposing key material. Locus, not the caller, encodes and classifies the transaction.",
         {
-            "chain": {"type": "string", "enum": ["evm", "solana", "sui"]},
-            "network": {"type": "string"},
+            "network_id": {
+                "type": "string",
+                "enum": ["eip155:11155111"],
+                "description": "CAIP-2 network identifier. The experimental signer supports Sepolia only.",
+            },
             "account_id": {"type": "string"},
-            "asset": {"type": "string"},
-            "recipient": {"type": "string"},
-            "contract": {"type": "string"},
-            "operation": {"type": "string"},
-            "amount": {"type": "string", "description": "Exact base-unit or decimal amount as a string."},
-            "maximum_fee": {"type": "string", "description": "Maximum fee as an exact string."},
-            "decoded": {"type": "boolean"},
-            "unlimited_approval": {"type": "boolean"},
+            "action": {
+                "type": "object",
+                "description": "A semantic action. Raw calldata and caller-supplied safety labels are not accepted.",
+                "properties": {
+                    "type": {"type": "string", "enum": ["native_transfer", "contract_call"]},
+                    "recipient": {"type": "string"},
+                    "amount_base_units": {"type": "string", "pattern": "^[0-9]+$"},
+                    "contract_id": {"type": "string"},
+                    "function": {"type": "string"},
+                    "arguments": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {"type": "string"},
+                                "value": {},
+                            },
+                            "required": ["type", "value"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "value_base_units": {"type": "string", "pattern": "^[0-9]+$"},
+                },
+                "required": ["type"],
+                "additionalProperties": False,
+            },
+            "maximum_fee_base_units": {
+                "type": "string",
+                "pattern": "^[0-9]+$",
+                "description": "Unsigned fee ceiling in the network's smallest unit.",
+            },
         },
-        ["chain", "network", "account_id", "asset", "recipient", "amount", "maximum_fee", "decoded"],
+        ["network_id", "account_id", "action", "maximum_fee_base_units"],
     ),
     _schema(
         "wallet_simulate_transaction",
@@ -687,6 +832,7 @@ class ToolRegistry:
         self._user_capability_policy: dict[str, bool] = {}
         self._solo_swarm_enabled = False
         self.computer_enabled = False
+        self.simulator_enabled = False
         #: Off until the app announces a live native broker, exactly like
         #: ``computer_enabled``. The browser is on by default *in the app's
         #: settings*, but defaulting it on here would make the headless CLI and
@@ -695,12 +841,16 @@ class ToolRegistry:
         # History is a separate opt-in inside Browser Settings. Keeping this
         # false removes the schema and also rejects guessed calls.
         self.browser_history_enabled = False
+        # Raw categories the user explicitly enabled. The tool is omitted when
+        # empty and its schema enum is narrowed to this set when present.
+        self.browser_autofill_categories: set[str] = set()
         #: Notes live in the native app, so the headless CLI must not advertise
         #: these schemas until a connected Locus instance announces its broker.
         self.notes_enabled = False
-        #: Full-custody tools are absent until the native app reports a live,
-        #: security-gated signer. Headless mode never advertises them.
-        self.wallet_enabled = False
+        #: The native app sends a versioned, session-bound capability. A bool
+        #: is not enough here: stale backends must not retain operations after
+        #: a signer lock or replacement session.
+        self.wallet_capability: dict[str, Any] | None = None
         self.refresh()
 
     def refresh(self) -> None:
@@ -797,6 +947,7 @@ class ToolRegistry:
             for key in (
                 "workspace_read", "workspace_write", "shell", "network", "mcp",
                 "computer_control",
+                "simulator_control",
             )
         }
 
@@ -806,8 +957,6 @@ class ToolRegistry:
 
     def _user_allows(self, name: str) -> bool:
         policy = self._user_capability_policy
-        if name == "delegate_read_only" and not policy.get("workspace_read", True):
-            return False
         if name in _WORKSPACE_READ_TOOLS and not policy.get("workspace_read", True):
             return False
         if name in _WORKSPACE_WRITE_TOOLS and not policy.get("workspace_write", True):
@@ -817,6 +966,8 @@ class ToolRegistry:
         if name == "web_fetch" and not policy.get("network", True):
             return False
         if name in _COMPUTER_TOOL_NAMES and not policy.get("computer_control", True):
+            return False
+        if name in _SIMULATOR_TOOL_NAMES and not policy.get("simulator_control", True):
             return False
         if name in _BROWSER_TOOL_NAMES and not policy.get("network", True):
             return False
@@ -861,6 +1012,10 @@ class ToolRegistry:
                 schema for schema in COMPUTER_TOOL_SCHEMAS
                 if self._user_allows(schema["function"]["name"])
             )
+        schemas.extend(
+            schema for schema in self.simulator_schemas()
+            if self._user_allows(schema["function"]["name"])
+        )
         schemas.extend(
             schema for schema in self.browser_schemas()
             if self._user_allows(schema["function"]["name"])
@@ -924,7 +1079,27 @@ class ToolRegistry:
                 schema for schema in TOOL_SCHEMAS
                 if schema["function"]["name"] == "submit_plan"
             )
+        schemas.extend(
+            schema for schema in self.simulator_schemas()
+            if self._user_allows(schema["function"]["name"])
+        )
         return schemas
+
+    def simulator_schemas(self) -> list[dict[str, Any]]:
+        if not self.simulator_enabled:
+            return []
+        return [
+            schema for schema in SIMULATOR_TOOL_SCHEMAS
+            if self.simulator_tool_allowed(schema["function"]["name"])
+        ]
+
+    def simulator_tool_allowed(self, name: str) -> bool:
+        """Enforce route authority even when a model guesses a hidden tool."""
+        if not self.simulator_enabled or name not in _SIMULATOR_TOOL_NAMES:
+            return False
+        if self._agent_access_ceiling == "read_only":
+            return name in _READ_ONLY_SIMULATOR_TOOLS
+        return True
 
     def browser_schemas(self) -> list[dict[str, Any]]:
         """Browser tools this agent may see.
@@ -935,10 +1110,18 @@ class ToolRegistry:
         """
         if not self.browser_enabled:
             return []
-        return [
-            schema for schema in BROWSER_TOOL_SCHEMAS
-            if self.browser_tool_allowed(schema["function"]["name"])
-        ]
+        schemas = []
+        for schema in BROWSER_TOOL_SCHEMAS:
+            name = schema["function"]["name"]
+            if not self.browser_tool_allowed(name):
+                continue
+            if name == "browser_autofill":
+                schema = copy.deepcopy(schema)
+                schema["function"]["parameters"]["properties"]["category"]["enum"] = sorted(
+                    self.browser_autofill_categories
+                )
+            schemas.append(schema)
+        return schemas
 
     def browser_tool_allowed(self, name: str) -> bool:
         """Whether this agent may actually run ``name``.
@@ -951,6 +1134,8 @@ class ToolRegistry:
         if not self.browser_enabled or name not in _BROWSER_TOOL_NAMES:
             return False
         if name == "browser_history" and not self.browser_history_enabled:
+            return False
+        if name == "browser_autofill" and not self.browser_autofill_categories:
             return False
         if self._agent_access_ceiling == "read_only":
             return name in _READ_ONLY_BROWSER_TOOLS
@@ -982,8 +1167,51 @@ class ToolRegistry:
     def wallet_tool_allowed(self, name: str) -> bool:
         if not self.wallet_enabled or name not in _WALLET_TOOL_NAMES:
             return False
+        allowed = set(self.wallet_capability.get("allowed_operations") or [])
+        if name not in allowed:
+            return False
         if self._agent_access_ceiling == "read_only":
             return name in _READ_ONLY_WALLET_TOOLS
+        return True
+
+    @property
+    def wallet_enabled(self) -> bool:
+        capability = self.wallet_capability
+        return bool(
+            capability
+            and capability.get("protocol_version") == 1
+            and capability.get("signer_state") == "unlocked"
+            and str(capability.get("session_id") or "").strip()
+        )
+
+    def configure_wallet_capability(self, value: Any) -> bool:
+        """Validate and install the native signer's least-authority surface."""
+        if not isinstance(value, dict):
+            self.wallet_capability = None
+            return False
+        operations = value.get("allowed_operations")
+        chains = value.get("supported_chains")
+        valid = (
+            value.get("protocol_version") == 1
+            and value.get("signer_state") == "unlocked"
+            and bool(str(value.get("session_id") or "").strip())
+            and isinstance(operations, list)
+            and bool(operations)
+            and set(operations) <= _WALLET_TOOL_NAMES
+            and isinstance(chains, list)
+            and bool(chains)
+            and all(isinstance(chain, str) and ":" in chain for chain in chains)
+        )
+        if not valid:
+            self.wallet_capability = None
+            return False
+        self.wallet_capability = {
+            "protocol_version": 1,
+            "signer_state": "unlocked",
+            "session_id": str(value["session_id"]),
+            "supported_chains": list(dict.fromkeys(chains)),
+            "allowed_operations": list(dict.fromkeys(operations)),
+        }
         return True
 
     def schema_tokens(self) -> int:
@@ -1195,6 +1423,8 @@ class ToolRegistry:
             return self._solo_swarm_enabled and self._user_allows(name)
         if self.computer_enabled and name in _READ_ONLY_COMPUTER_TOOLS:
             return True
+        if self.simulator_tool_allowed(name) and name in _READ_ONLY_SIMULATOR_TOOLS:
+            return True
         if self.browser_tool_allowed(name) and name in _READ_ONLY_BROWSER_TOOLS:
             return True
         if self.notes_enabled and name in _READ_ONLY_NOTES_TOOLS:
@@ -1224,6 +1454,37 @@ class ToolRegistry:
         if policy in {"ask", "prompt", "disabled"}:
             return False
         return annotation_safe
+
+    def is_read_only_tool(self, name: str) -> bool:
+        """Whether a Solo worker may receive ``name`` while Plan mode is locked.
+
+        Permission-free and read-only are intentionally different concepts:
+        ``web_fetch`` asks in normal Ask mode but does not mutate user state,
+        while ``todo_write`` is permission-free and does mutate the root chat.
+        """
+        if name in _READ_ONLY_BUILTIN_TOOLS:
+            return True
+        info = self.tool_info(name)
+        if not info:
+            return False
+        annotations = info.get("annotations") if isinstance(info.get("annotations"), dict) else {}
+        return (
+            annotations.get("readOnlyHint") is True
+            and annotations.get("destructiveHint") is not True
+        )
+
+    def is_parallel_safe_tool(self, name: str) -> bool:
+        """Whether separate Solo workers may execute this tool concurrently."""
+        if name in _PARALLEL_SAFE_BUILTIN_TOOLS:
+            return True
+        info = self.tool_info(name)
+        if not info or info.get("origin") != "mcp":
+            return False
+        annotations = info.get("annotations") if isinstance(info.get("annotations"), dict) else {}
+        return (
+            annotations.get("readOnlyHint") is True
+            and annotations.get("destructiveHint") is not True
+        )
 
     def _allows_mcp_item(
         self,
@@ -1266,9 +1527,20 @@ class ToolRegistry:
                 "origin": "native",
                 "annotations": {"readOnlyHint": name in _READ_ONLY_COMPUTER_TOOLS},
             }
+        if self.simulator_enabled and name in _SIMULATOR_TOOL_NAMES:
+            return {
+                "origin": "simulator",
+                "annotations": {
+                    "readOnlyHint": name in _READ_ONLY_SIMULATOR_TOOLS,
+                },
+            }
         # Gated on the flag, so a call made while the browser is off falls
         # through to the unknown-tool path rather than reaching a dead executor.
-        if self.browser_tool_allowed(name):
+        # Identify the native family before applying per-route authorization.
+        # AgentCore repeats browser_tool_allowed immediately before dispatch, so
+        # a model that guesses a hidden mutating name receives an explicit
+        # authority denial and can never fall through to a builtin executor.
+        if self.browser_enabled and name in _BROWSER_TOOL_NAMES:
             return {
                 "origin": "browser",
                 "annotations": {"readOnlyHint": name in _READ_ONLY_BROWSER_TOOLS},
@@ -1278,7 +1550,7 @@ class ToolRegistry:
                 "origin": "notes",
                 "annotations": {"readOnlyHint": name in _READ_ONLY_NOTES_TOOLS},
             }
-        if self.wallet_tool_allowed(name):
+        if self.wallet_enabled and name in _WALLET_TOOL_NAMES:
             return {
                 "origin": "wallet",
                 "annotations": {
@@ -1308,6 +1580,7 @@ class ToolRegistry:
         base_schemas = _base_schemas(self._agent_access_ceiling)
         if self.computer_enabled and self._agent_access_ceiling != "read_only":
             base_schemas.extend(COMPUTER_TOOL_SCHEMAS)
+        base_schemas.extend(self.simulator_schemas())
         base_schemas.extend(self.browser_schemas())
         base_schemas.extend(self.notes_schemas())
         base_schemas.extend(self.wallet_schemas())
@@ -1323,6 +1596,7 @@ class ToolRegistry:
                 "origin": (
                     "builtin" if schema in TOOL_SCHEMAS
                     else "native" if schema in COMPUTER_TOOL_SCHEMAS
+                    else "simulator" if schema in SIMULATOR_TOOL_SCHEMAS
                     else "browser" if schema in BROWSER_TOOL_SCHEMAS
                     else "notes" if schema in NOTES_TOOL_SCHEMAS
                     else "wallet" if schema in WALLET_TOOL_SCHEMAS
@@ -1333,6 +1607,7 @@ class ToolRegistry:
                 "annotations": {
                     "readOnlyHint": fn["name"] in _SAFE_EXTENSION_TOOLS
                     or fn["name"] in _READ_ONLY_COMPUTER_TOOLS
+                    or fn["name"] in _READ_ONLY_SIMULATOR_TOOLS
                     or fn["name"] in _READ_ONLY_BROWSER_TOOLS
                     or fn["name"] in _READ_ONLY_NOTES_TOOLS
                     or fn["name"] in _READ_ONLY_WALLET_TOOLS
@@ -1362,5 +1637,6 @@ __all__ = [
     "COMPUTER_TOOL_SCHEMAS",
     "EXTENSION_TOOL_SCHEMAS",
     "NOTES_TOOL_SCHEMAS",
+    "SIMULATOR_TOOL_SCHEMAS",
     "ToolRegistry",
 ]

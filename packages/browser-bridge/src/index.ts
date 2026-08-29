@@ -26,18 +26,31 @@ export const browserBridgeSource = String.raw`
       && Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
   }
 
-  function isSensitive(element) {
-    if (!(element instanceof Element)) return false;
-    const input = element instanceof HTMLInputElement ? element : element.querySelector?.('input');
-    if (input?.type?.toLowerCase() === 'password') return true;
-    const autocomplete = input?.autocomplete || element.getAttribute('autocomplete') || '';
-    if (/password|cc-|one-time-code|webauthn/i.test(autocomplete)) return true;
+  function sensitiveCategory(element) {
+    if (!(element instanceof Element)) return null;
+    const field = element.matches?.('input, select, textarea')
+      ? element : element.querySelector?.('input, select, textarea');
+    if (field instanceof HTMLInputElement && field.type?.toLowerCase() === 'password') {
+      return 'password';
+    }
+    const autocomplete = field?.getAttribute('autocomplete')
+      || element.getAttribute('autocomplete') || '';
+    const token = autocomplete.toLowerCase().split(/\s+/).pop() || '';
+    if (token === 'current-password' || token === 'new-password') return 'password';
+    if (token === 'cc-csc') return 'securityCode';
+    if (token.startsWith('cc-')) return 'paymentCard';
+    if (token === 'one-time-code') return 'oneTimeCode';
+    if (token === 'webauthn') return 'protected';
     return sensitivePattern.test([
       element.id,
       element.getAttribute('name'),
       element.getAttribute('aria-label'),
       element.getAttribute('placeholder'),
-    ].filter(Boolean).join(' '));
+    ].filter(Boolean).join(' ')) ? 'protected' : null;
+  }
+
+  function isSensitive(element) {
+    return sensitiveCategory(element) !== null;
   }
 
   function nameFor(element) {
@@ -203,6 +216,7 @@ export const browserBridgeSource = String.raw`
         role: roleFor(element),
         name: nameFor(element),
         protected: isSensitive(element),
+        protectedCategory: sensitiveCategory(element),
         rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
       });
       if (elements.length >= Math.min(Number(options.limit || 500), 1000)) break;
@@ -238,15 +252,21 @@ export const browserBridgeSource = String.raw`
     };
   }
 
-  function setValue(ref, value) {
+  function setValue(ref, value, allowedCategories = []) {
     const result = resolve(ref);
     if (!result.element) return result;
-    if (isSensitive(result.element)) return { protected: true, error: 'protected field' };
     const element = result.element;
+    const category = sensitiveCategory(element);
+    const allowed = new Set(Array.isArray(allowedCategories) ? allowedCategories : []);
+    if (category && !(['password', 'paymentCard'].includes(category) && allowed.has(category))) {
+      return { protected: true, protectedCategory: category, error: 'protected field' };
+    }
     if (!('value' in element)) return { error: 'element does not accept a value' };
     const prototype = element instanceof HTMLTextAreaElement
       ? HTMLTextAreaElement.prototype
-      : HTMLInputElement.prototype;
+      : element instanceof HTMLSelectElement
+        ? HTMLSelectElement.prototype
+        : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
     if (setter) setter.call(element, String(value)); else element.value = String(value);
     element.dispatchEvent(new Event('input', { bubbles: true }));
@@ -284,10 +304,18 @@ export const browserBridgeSource = String.raw`
     setValue,
     sensitiveAt(x, y) {
       const element = document.elementFromPoint(Number(x), Number(y));
-      return { protected: isSensitive(element), name: element ? nameFor(element) : '' };
+      return {
+        protected: isSensitive(element),
+        protectedCategory: sensitiveCategory(element),
+        name: element ? nameFor(element) : '',
+      };
     },
     focusedSensitive() {
-      return { protected: isSensitive(document.activeElement), name: document.activeElement ? nameFor(document.activeElement) : '' };
+      return {
+        protected: isSensitive(document.activeElement),
+        protectedCategory: sensitiveCategory(document.activeElement),
+        name: document.activeElement ? nameFor(document.activeElement) : '',
+      };
     },
     hasSensitiveFields() {
       return Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]')).some(isSensitive);
@@ -344,8 +372,8 @@ export const bridgeInvocation = {
     `globalThis.__locusBrowserBridge.readerDocument(${JSON.stringify(options)})`,
   target: (ref: string) =>
     `globalThis.__locusBrowserBridge.target(${JSON.stringify(ref)})`,
-  setValue: (ref: string, value: string) =>
-    `globalThis.__locusBrowserBridge.setValue(${JSON.stringify(ref)}, ${JSON.stringify(value)})`,
+  setValue: (ref: string, value: string, allowedCategories: string[] = []) =>
+    `globalThis.__locusBrowserBridge.setValue(${JSON.stringify(ref)}, ${JSON.stringify(value)}, ${JSON.stringify(allowedCategories)})`,
   find: (query: string) =>
     `globalThis.__locusBrowserBridge.find(${JSON.stringify(query)})`,
   sensitiveAt: (x: number, y: number) =>

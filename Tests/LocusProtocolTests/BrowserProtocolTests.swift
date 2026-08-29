@@ -3,17 +3,23 @@ import Testing
 @testable import LocusProtocol
 
 @Test func browserToolParityIsStable() {
-    #expect(BrowserToolName.allCases.count == 14)
+    #expect(BrowserToolName.allCases.count == 15)
     #expect(BrowserToolName.history.rawValue == "browser_history")
+    #expect(BrowserToolName.autofill.rawValue == "browser_autofill")
     #expect(BrowserToolName.readPage.rawValue == "browser_read_page")
     #expect(BrowserToolName.devServer.rawValue == "browser_dev_server")
 }
 
-@Test func browserHistoryUsesAnIndependentOptIn() throws {
-    let control = SetBrowserControl(enabled: true, historyEnabled: true)
+@Test func browserDataAccessUsesIndependentGrants() throws {
+    let control = SetBrowserControl(
+        enabled: true,
+        historyEnabled: true,
+        autofillCategories: [.password, .paymentCard]
+    )
     let object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(control)) as? [String: Any])
     #expect(object["type"] as? String == "set_browser_control")
     #expect(object["history_enabled"] as? Bool == true)
+    #expect(object["autofill_categories"] as? [String] == ["password", "paymentCard"])
 }
 
 @Test func requestUsesWireCompatibleSnakeCase() throws {
@@ -64,9 +70,30 @@ import Testing
     #expect(memories.first?["blob_id"] as? String == "walrus-blob-1")
     #expect(memories.first?["content_sha256"] as? String == String(repeating: "a", count: 64))
 
+    let capability = SetWalletControl(capability: WalletCapability(
+        sessionId: "native-session-1",
+        supportedChains: ["eip155:11155111"],
+        allowedOperations: [.listAccounts, .prepareTransaction]
+    ))
+    let capabilityObject = try #require(
+        JSONSerialization.jsonObject(with: JSONEncoder().encode(capability)) as? [String: Any]
+    )
+    let capabilityPayload = try #require(capabilityObject["capability"] as? [String: Any])
+    #expect(capabilityPayload["protocol_version"] as? Int == 1)
+    #expect(capabilityPayload["session_id"] as? String == "native-session-1")
+
     let request = WalletActionRequest(
         requestId: "wallet-1", tool: .prepareTransaction,
-        arguments: ["chain": .string("evm"), "amount": .string("1.0")],
+        arguments: [
+            "network_id": .string("eip155:11155111"),
+            "account_id": .string("account-1"),
+            "action": .object([
+                "type": .string("native_transfer"),
+                "recipient": .string("0x0000000000000000000000000000000000000001"),
+                "amount_base_units": .string("1"),
+            ]),
+            "maximum_fee_base_units": .string("1000000000000000"),
+        ],
         timeoutMs: 60_000, sessionId: "session-1"
     )
     let requestObject = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any])

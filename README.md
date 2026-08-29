@@ -10,6 +10,7 @@ This repository owns the parts of the product that must stay wire-compatible:
 - the signed Apple Natural Language semantic helper and strict Reader/Recall
   content extraction contracts;
 - typed, citation-validated, read-only Research Board messages and runtime;
+- category-gated encrypted Autofill and least-authority wallet broker contracts;
 - protocol fixtures and the direct-download parity manifest.
 
 The native Swift Locus app and the Electron Locus Browser keep separate UI and
