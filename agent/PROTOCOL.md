@@ -661,8 +661,8 @@ Endpoint: `/ws/chat`.
   ("Agent is busy — press Stop first."). This includes `user_message`,
   `new_session`, `retry_last`, `compact`, `resume`, `set_model`, `set_cwd`,
   `set_permission_mode`, and `clear`. Only `interrupt`, permission decisions,
-  `steer`, native computer/browser/Notes/wallet action results, and heartbeat
-  traffic remain accepted.
+  `steer`, native computer/simulator/browser/Notes/wallet action results, and
+  heartbeat traffic remain accepted.
 
 ---
 
@@ -670,18 +670,21 @@ Endpoint: `/ws/chat`.
 
 | `type` | Extra fields | Effect |
 |---|---|---|
-| `user_message` | `text: string`, optional `mode: "ask" \| "work" \| "plan" \| "build"`, optional versioned `agent_config`, optional `attachments`, optional `portable_memory`, optional `team` manifest | Runs one solo or dispatcher-led team turn. `portable_memory` is an explicit, ephemeral evidence attachment: at most 5 records and 12,000 total text characters, each retaining its Walrus blob ID and optional source URL, capture time, and SHA-256. The runtime wraps it as untrusted evidence and does not persist it with the visible user message. `agent_config` controls editable display identity, description, response style, custom/per-mode guidance, narrowing capability switches, memory policy, and runtime limits. It is snapshotted for the complete turn; factual provider/model identity, safety rules, permission policy, and mode boundaries remain locked runtime layers. Existing clients may omit it. A team manifest contains one explicit team, its enabled profiles and ephemeral routes, optional forced member, and bounded budgets; each profile may carry the same additive `behavior` object. Credentials are accepted only in memory and are never echoed or persisted. Slash commands and Chat mode reject team routing. Image `attachments` are valid in **every** mode: PNG/JPEG/GIF/WebP, at most 10 per message, 15 MB per image, 25 MB in total, base64 `data` with a `mime_type` and optional `name`. They ride the turn in memory only — the persisted session record keeps the text and attachment names, never image bytes, so a restored or resumed conversation carries no images. On a team turn the images reach the dispatcher and the first coding job's first slice; specialists, reviewers, and synthesis receive text evidence only, and the server emits a `note` event saying so before dispatch. A provider that explicitly rejects image input triggers one automatic retry with the images stripped from history, announced by a `note`. |
+| `user_message` | `text: string`, optional `mode: "ask" \| "work" \| "plan" \| "build"`, optional versioned `agent_config`, optional `attachments`, optional `browser_context`, optional `portable_memory`, optional `team` manifest | Runs one solo or dispatcher-led team turn. `browser_context` and `portable_memory` are bounded, ephemeral, untrusted evidence and are not persisted with the visible message. `agent_config` controls editable display identity, description, response style, custom/per-mode guidance, narrowing capability switches, memory policy, and runtime limits. It is snapshotted for the complete turn; factual provider/model identity, safety rules, permission policy, and mode boundaries remain locked runtime layers. Existing clients may omit it. A team manifest contains one explicit team, its enabled profiles and ephemeral routes, optional forced member, and bounded budgets; each profile may carry the same additive `behavior` object. Credentials are accepted only in memory and are never echoed or persisted. Slash commands and Chat mode reject team routing. Image `attachments` are valid in **every** mode: PNG/JPEG/GIF/WebP, at most 10 per message, 15 MB per image, 25 MB in total, base64 `data` with a `mime_type` and optional `name`. They ride the turn in memory only — the persisted session record keeps the text and attachment names, never image bytes, so a restored or resumed conversation carries no images. On a team turn the images reach the dispatcher and the first coding job's first slice; specialists, reviewers, and synthesis receive text evidence only, and the server emits a `note` event saying so before dispatch. A provider that explicitly rejects image input triggers one automatic retry with the images stripped from history, announced by a `note`. |
+| `research_board_request` | `request_id: string`, `prompt: string`, `format: "comparison" \| "brief" \| "evidence"`, `sources: object[]` | Runs one read-only research synthesis over 1–10 explicitly shared, content-hashed sources and their stable passage IDs. Source text is bounded to 120,000 characters and output citations are validated before the result is emitted. |
 | `permission_decision` | `request_id: string`, `decision: "once" \| "always" \| "deny"` | Answers a `permission_request`. Unknown/invalid values are treated as `deny`. Late answers are ignored. |
 | `interrupt` | — | Soft-interrupts the current turn: streaming stops after the current chunk, pending permission waits are denied, turn ends with `turn_done {reason: "interrupted"}`. Safe to send when idle. |
-| `steer` | `text: string` | Adds direction to the active turn. It interrupts only the current provider generation, waits for an already-running tool/native action to reach a safe boundary, and continues the same turn without an intermediate `turn_done`. |
+| `steer` | `text: string`, optional `browser_context` | Adds direction to the active turn. Fresh live-browser evidence is validated and appended as untrusted context. Steering interrupts only the current provider generation, waits for an already-running tool/native action to reach a safe boundary, and continues the same turn without an intermediate `turn_done`. |
 | `set_computer_control` | `enabled: boolean`, `native_available: boolean` | Advertises the direct-build native broker. Computer tools enter model schemas only when both values are true. Rejected while a turn is busy. |
 | `computer_action_result` | `request_id: string`, `result: object` | Completes one pending native broker request. `result` may contain `text`, `error`, and optional `screenshot` metadata/data. Late, duplicate, and unknown IDs are ignored after cancellation or timeout. |
-| `set_browser_control` | `enabled: boolean`, optional `history_enabled: boolean` | Advertises the native browser broker. Browser tools enter model schemas only while `enabled` is true; `browser_history` also requires the separate history opt-in. Rejected while a turn is busy, so the client re-sends after `turn_done`. Unlike computer control there is no `native_available`: a web view needs no special access and is present in every build. |
+| `set_simulator_control` | `enabled: boolean`, `native_available: boolean`, optional `attached_device: {udid, name, runtime, family, state}` | Advertises the direct-download Simulator broker for one task-leased device. Simulator schemas enter the model only when the helper is compatible and the message includes a non-empty attached UDID. Rejected while a turn is busy. |
+| `simulator_action_result` | `request_id: string`, `result: object` | Completes one pending Simulator request. Results contain `text` or `error`, may include structured `build` failure details, and may use the shared newest-only `screenshot` observation. Late, duplicate, and unknown IDs are ignored after cancellation, timeout, disconnect, or detach. |
+| `set_browser_control` | `enabled: boolean`, `history_enabled: boolean`, `autofill_categories: ("password" \| "contact" \| "paymentCard")[]` | Advertises the native browser broker and its current data-access grants. Browser tools enter model schemas only while enabled; history and Autofill schemas are independently omitted unless granted, and the Autofill category enum is narrowed to the supplied list. Rejected while a turn is busy, so the client re-sends this complete canonical payload after `turn_done`. Unlike computer control there is no `native_available`: a web view needs no special access and is present in every build. |
 | `browser_action_result` | `request_id: string`, `result: object` | Completes one pending browser request. `result` may contain `text`, `error`, and optional `screenshot` metadata/data. Late, duplicate, and unknown IDs are ignored after cancellation or timeout. |
 | `set_notes_control` | `enabled: boolean` | Advertises the native Notes broker. `notes_read` and `notes_update` enter model schemas only while true; read-only routes receive only `notes_read`. The native app, not the model, resolves the workspace/chat owner and current scope. Rejected while a turn is busy. |
 | `notes_action_result` | `request_id: string`, `result: object` | Completes one pending Notes request. `result` contains `text` or `error`; late, duplicate, and unknown IDs are ignored after cancellation or timeout. |
-| `set_wallet_control` | `enabled: boolean` | Advertises a live native Locus Vault policy gateway. Wallet schemas remain absent in headless mode and until the native signer says it is available. Rejected while a turn is busy. |
-| `wallet_action_result` | `request_id: string`, `result: object` | Completes one pending wallet request. `result` contains `text` or `error`; late, duplicate, and unknown IDs are ignored after cancellation or timeout. Native policy remains authoritative regardless of agent permission mode. |
+| `set_wallet_control` | `capability: {protocol_version: 1, signer_state: "unlocked", session_id: string, supported_chains: string[], allowed_operations: string[]}` | Replaces the current least-authority signer capability. Missing, stale boolean, malformed, locked, empty, or unknown-operation capabilities fail closed and remove wallet schemas. Rejected while a turn is busy. |
+| `wallet_action_result` | `request_id: string`, `result: object` | Completes one pending wallet request. Late, duplicate, and unknown IDs are ignored after cancellation or timeout; the native signer remains authoritative regardless of agent permission mode. |
 | `set_model` | `model: string` | Switches model (substring match allowed). Emits `session_info` on success, `command_error` if rejected. Persisted to config. |
 | `set_cwd` | `path: string` | Changes the agent working directory. Emits `session_info` on success, `command_error` otherwise. |
 | `set_permission_mode` | `mode: "ask" \| "accept_edits" \| "bypass"` | Changes the permission mode while idle and emits `session_info`. |
@@ -692,14 +695,31 @@ Endpoint: `/ws/chat`.
 | `resume` | `session_id: string` | Resumes a saved session. Ends with `slash_result {command: "resume", data: {messages: [...]}}`. Rejected when busy. |
 | `ping` | — | Emits `pong`; used as an ordering sentinel. |
 
+`browser_context` requires a recording identity and may carry one active tab,
+up to 200 timestamped transcript segments (24,000 characters), 12,000
+characters of visible page text, and up to four PNG/JPEG/WebP frames totalling
+8 MB. `portable_memory` accepts at most five records and 12,000 total text
+characters; every record retains its blob ID and may retain a source URL,
+capture time, and SHA-256. Both inputs are wrapped with explicit untrusted-
+evidence boundaries before they reach a model. Frames are in-memory attachments;
+the stored user message remains the original text.
+
 Every ordinary Solo Work, Plan, or Build `user_message` enables adaptive
 delegation. The deprecated `solo_swarm: {"enabled": true}` field remains
 accepted for older clients but is no longer required. The backend snapshots
 the selected route and temporarily exposes one bounded `delegate_read_only`
 tool to the visible root.
-Workers use the same provider/model, remain depth-one and workspace-read-only,
-and emit the existing agent activity plus `swarm_telemetry` events. Ask, slash,
-and team messages never expose delegation. `run_kind` remains `solo`.
+Workers use the same provider/model, remain depth-one, and inherit the root's
+currently available tools and permission mode by default. Each delegated task
+may instead provide an exact `tools` allowlist; `tools: []` creates a model-only
+worker. Recursive delegation plus root plan/todo, memory, and skill-observation
+controls are never inherited, and Plan-mode workers receive only non-mutating
+tools. Every worker call is revalidated against the root capability policy and
+runs through the root permission/safety path. Read-only calls may overlap;
+writes, shell, unannotated or mutating MCP, and native shared-state calls share
+one per-turn execution gate. Workers emit the existing agent activity plus
+`swarm_telemetry` events. Ask, slash, and team messages never expose delegation.
+`run_kind` remains `solo`.
 
 A team budget may include `call_budget_mode: "automatic" | "fixed"`.
 `automatic` resolves to the bounded 100-call adaptive pool; `fixed` preserves
@@ -782,6 +802,36 @@ Provider signatures and redacted reasoning are never sent.
 `message_start … message_end` pair wraps each model call, so a multi-tool turn
 contains several pairs.
 
+These events remain the compatibility protocol for existing providers. Managed
+Codex App Server turns use the structured assistant-item events below instead.
+
+### `assistant_item_start` / `assistant_item_delta` / `assistant_item_end`
+
+Structured assistant streaming preserves the Codex App Server item lifecycle
+instead of flattening every assistant item into one string:
+
+```json
+{ "type": "assistant_item_start", "item_id": "msg_1",
+  "kind": "message", "phase": "commentary" }
+{ "type": "assistant_item_delta", "item_id": "msg_1",
+  "kind": "message", "phase": "commentary", "text": "Checking…" }
+{ "type": "assistant_item_end", "item_id": "msg_1",
+  "kind": "message", "phase": "commentary", "text": "Checking…" }
+```
+
+`kind` is `message` or `reasoning`. Message `phase` is `commentary` or
+`final_answer`; a missing or unknown phase resolves to `final_answer`.
+Reasoning deltas additionally carry `section_index`, and their completed event
+contains the authoritative ordered `sections` array. Only public reasoning
+summaries are emitted; private reasoning text and redacted payloads are never
+sent.
+
+The completed item is authoritative and may replace its accumulated deltas.
+Clients must tolerate a missed start, ignore duplicate completions and late
+deltas, and retain commentary and final-answer items as distinct transcript
+rows in original order. Reasoning items are display-only and must not be sent
+back to a provider as conversation context.
+
 ### `plan_ready`
 
 Emitted after the permission-free `submit_plan` tool succeeds. It is a final
@@ -823,11 +873,39 @@ mutation. A screenshot result is an ephemeral newest-only observation; routes
 that reject images are retried once without it and remain Accessibility-only
 for the session.
 
+### `simulator_control_status` / `simulator_action_request`
+
+`simulator_control_status {enabled, attached_device}` acknowledges the
+direct-download Simulator capability handshake. The server exposes these tools
+only while one compatible device is explicitly attached to the task:
+`simulator_list_devices`, `simulator_attach`, `simulator_get_state`,
+`simulator_tap`, `simulator_swipe`, `simulator_type_text`,
+`simulator_press_button`, `simulator_open_url`,
+`simulator_build_and_launch`, `simulator_screenshot`, and `simulator_detach`.
+Read-only agent routes receive only list, state, and screenshot.
+
+```json
+{ "type": "simulator_action_request", "request_id": "...",
+  "session_id": "...", "tool": "simulator_tap",
+  "arguments": {"element": "a1b2c3d4-7"}, "timeout_ms": 120000 }
+```
+
+The native client always resolves the request against `session_id` and the
+UDID leased to that task; arguments cannot select another device. Calls are
+serialized per UDID. Builds may wait up to 600 seconds and every other action
+up to 120 seconds. `simulator_get_state` returns logical device dimensions,
+bounded Accessibility elements with frames, and snapshot-scoped element IDs;
+every mutation invalidates those IDs. Interrupt, task stop, socket teardown,
+helper failure, shutdown, and detach cancel matching pending requests. Detach
+releases the lease without shutting down, erasing, or deleting the device.
+Simulator screenshots share the same ephemeral visual-observation slot as
+computer screenshots; image-incompatible routes receive Accessibility text
+and one visible fallback diagnostic.
+
 ### `browser_control_status` / `browser_action_request`
 
-`browser_control_status {enabled, history_enabled}` acknowledges the browser
-capability handshake. `history_enabled` is true only when the broker is live
-and the user has separately enabled agent access to history. When enabled, a
+`browser_control_status {enabled, history_enabled, autofill_categories}`
+acknowledges the complete browser capability handshake. When enabled, a
 browser tool call emits:
 
 ```json
@@ -857,6 +935,16 @@ served immediately and answered on that worker's own socket rather than being
 held until the user opens its conversation: driving a web view takes nothing
 away from the person at the keyboard.
 
+### `research_board_progress` / `research_board_result` / `research_board_error`
+
+A valid `research_board_request` emits bounded progress messages followed by
+exactly one result or error for the same `request_id`. Results contain a typed
+artifact with sections, claims, and one or more `{source_id, passage_id}`
+citations per claim. The runtime rejects malformed output, missing citations,
+and citations to evidence that was not supplied. Research uses no tools,
+performs no additional browsing, and does not persist the supplied passages in
+ordinary session history.
+
 ### `notes_control_status` / `notes_action_request`
 
 `notes_control_status {enabled}` acknowledges the native Notes capability.
@@ -879,23 +967,28 @@ foreground chat.
 
 ### `wallet_control_status` / `wallet_action_request`
 
-`wallet_control_status {enabled}` acknowledges a live native Locus Vault
-gateway. When enabled, a wallet tool call emits:
+`wallet_control_status {enabled, protocol_version, session_id}` acknowledges the
+validated native signer capability. The active wallet schema is the intersection
+of its `allowed_operations` and the current agent access ceiling. When enabled,
+a wallet tool call emits:
 
 ```json
 { "type": "wallet_action_request", "request_id": "...",
   "tool": "wallet_prepare_transaction",
-  "arguments": {"chain": "evm", "amount": "1.0"},
+  "arguments": {
+    "network_id": "eip155:11155111", "account_id": "account-1",
+    "action": {"type": "native_transfer", "recipient": "0x...", "amount_base_units": "1"},
+    "maximum_fee_base_units": "1000000000000000"
+  },
   "timeout_ms": 60000, "session_id": "..." }
 ```
 
 The worker accepts exactly one matching `wallet_action_result`, times out after
 60 seconds, and cancels pending requests on interrupt, orchestration
-cancellation, or socket teardown. Capability advertisement and direct lookup
-both fail closed when the gateway is absent. Read-only routes receive only
-account, balance, and activity queries. Preparing, simulating, or executing a
-transaction remains subject to the independent native policy gateway; Bypass
-mode cannot approve or weaken wallet policy.
+cancellation, or socket teardown. Read-only routes receive only account,
+balance, and activity queries. The signer independently rechecks semantic
+intent, network, policy, budget, expiry, nonce, simulation state, and digest at
+the irreversible boundary; Bypass mode cannot approve or weaken that policy.
 
 ### Team orchestration and scheduler events
 
@@ -1165,7 +1258,13 @@ When the browser broker is enabled the schema also contains `browser_read_page`,
 `browser_get_text`, `browser_find`, `browser_screenshot`, `browser_wait_for`,
 `browser_console`, `browser_network`, `browser_tabs`, `browser_navigate`,
 `browser_input`, `browser_resize`, `browser_javascript`, and
-`browser_dev_server`. The reading half is
+`browser_dev_server`. `browser_history` is added only while history access is
+enabled. `browser_autofill` is added only while at least one model-access
+category is enabled, and its category enum contains only those grants. It can
+`list` metadata, `get` a raw record, or natively `fill` matching fields. Saved
+password operations require the target tab's exact normalized origin; contacts
+and payment cards are global. Security codes are never stored or returned.
+Autofill remains unavailable to read-only agents. The reading half is
 permission-free and stays available to read-only agents, which is a deliberate
 departure from computer control — a reviewer should be able to look at the page
 it is reviewing. Everything else follows the permission mode, and
@@ -1176,23 +1275,19 @@ its command, keeps a bounded output ring readable through `status`, and kills
 every server at backend shutdown — a server otherwise outlives the conversation
 that started it. Navigation is restricted
 to `http`, `https` and `about`: a `file:` URL would otherwise read any file
-without passing through `read_file`'s workspace scoping or its prompt. Typing a
-credential is hard blocked on both sides — by content in the agent, and by the
-field's own type, its autocomplete hint, and whether its form holds a password
-in the app.
+without passing through `read_file`'s workspace scoping or its prompt. The app
+classifies password, payment-card, card-security-code, and one-time-code fields.
+Password and payment-card input is accepted only while the matching model
+setting is enabled; card security codes and one-time codes are always blocked.
 
-When separately enabled, `browser_history` returns only URL, title, and visit
-time through a bounded, paginated search. It never returns page content,
-autofill data, or credential/payment fields, and a guessed call is rejected at
-lookup time when history access is off.
-
-When a live Locus Vault gateway is enabled the schema also contains
+When a valid native signer capability is installed, the schema can also contain
 `wallet_list_accounts`, `wallet_get_balance`, `wallet_get_activity`,
 `wallet_prepare_transaction`, `wallet_simulate_transaction`,
 `wallet_execute_transaction`, and `wallet_lock`. The first three remain
-available to read-only agents. All transaction authority stays behind the
-native policy gateway, which rechecks decoded intent, network, budget, expiry,
-nonce, and simulation state and never exposes key or recovery material.
+available to read-only agents when the signer capability allows them. The
+experimental transaction contract is semantic and Sepolia-only: it accepts
+decoded actions and exact unsigned base-unit strings, never raw calldata,
+caller-supplied risk labels, arbitrary messages, or key/recovery material.
 
 JavaScript dialogs never block the page: alerts are acknowledged, and an
 unarmed `confirm`/`prompt` takes the safe branch — dismissed — with the outcome

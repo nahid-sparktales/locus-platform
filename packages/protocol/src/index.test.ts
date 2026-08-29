@@ -8,6 +8,7 @@ import {
   ResearchBoardResultSchema,
   SpeechSettingsSchema,
   SetBrowserControlSchema,
+  SetWalletControlSchema,
   TabAccessGrantSchema,
   WalletActionRequestSchema,
   WalletActionResultSchema,
@@ -18,9 +19,10 @@ import {
 
 describe("browser protocol", () => {
   it("keeps the complete browser tool contract", () => {
-    expect(browserToolNames).toHaveLength(14);
+    expect(browserToolNames).toHaveLength(15);
     expect(new Set(browserToolNames).size).toBe(browserToolNames.length);
     expect(browserToolNames).toContain("browser_history");
+    expect(browserToolNames).toContain("browser_autofill");
   });
 
   it("keeps browser history behind its separate opt-in", () => {
@@ -28,17 +30,39 @@ describe("browser protocol", () => {
       type: "set_browser_control",
       enabled: true,
       history_enabled: true,
+      autofill_categories: ["password", "paymentCard"],
     });
     expect(control.history_enabled).toBe(true);
+    expect(control.autofill_categories).toEqual(["password", "paymentCard"]);
   });
 
   it("keeps the bounded wallet broker wire contract", () => {
     expect(walletToolNames).toHaveLength(7);
+    const control = SetWalletControlSchema.parse({
+      type: "set_wallet_control",
+      capability: {
+        protocol_version: 1,
+        signer_state: "unlocked",
+        session_id: "native-session-1",
+        supported_chains: ["eip155:11155111"],
+        allowed_operations: ["wallet_list_accounts", "wallet_prepare_transaction"],
+      },
+    });
+    expect(control.capability?.session_id).toBe("native-session-1");
     const request = WalletActionRequestSchema.parse({
       type: "wallet_action_request",
       request_id: "wallet-1",
       tool: "wallet_prepare_transaction",
-      arguments: { chain: "evm", amount: "1.0" },
+      arguments: {
+        network_id: "eip155:11155111",
+        account_id: "account-1",
+        action: {
+          type: "native_transfer",
+          recipient: "0x0000000000000000000000000000000000000001",
+          amount_base_units: "1",
+        },
+        maximum_fee_base_units: "1000000000000000",
+      },
       timeout_ms: 60_000,
       session_id: "session-1",
     });

@@ -9,6 +9,9 @@ future) can both drive it.
 Event types emitted:
     message_start / token / message_end     assistant streaming
     thinking                                {text} reasoning-model output
+    assistant_item_start                    {item_id, kind, phase?}
+    assistant_item_delta                    {item_id, kind, phase?, section_index?, text}
+    assistant_item_end                      {item_id, kind, phase?, text?, sections?}
     tool_call_proposed                      {id, tool, summary, detail, auto}
     permission_request                      {request_id, id, tool, preview}
     tool_result                             {id, tool, summary, result, ok, denied}
@@ -31,6 +34,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -81,6 +85,15 @@ from .tools import ToolContext, execute_tool
 EventHandler = Callable[[dict[str, Any]], None]
 PermissionDecider = Callable[[str, str, str, str], str]
 """(tool_name, summary, detail, request_id) -> "once" | "always" | "deny"."""
+
+_SOLO_ROOT_ONLY_TOOLS = {
+    "delegate_read_only",
+    "todo_write",
+    "submit_plan",
+    "capture_context_snapshot",
+    "propose_memory",
+    "record_skill_observation",
+}
 
 # AGENTS.md is Locus's native/Codex-compatible instruction file. Older
 # OLLAMA.md and CLAUDE.md workspaces remain compatible when it is absent.
@@ -387,6 +400,7 @@ class AgentCore:
         self._turn_allows_tools = True
         self._last_turn_allowed_tools = True
         self.computer_executor: Callable[[str, dict[str, Any], str], str] | None = None
+        self.simulator_executor: Callable[[str, dict[str, Any], str], str] | None = None
         self.browser_executor: Callable[[str, dict[str, Any], str], str] | None = None
         self.notes_executor: Callable[[str, dict[str, Any], str], str] | None = None
         self.wallet_executor: Callable[[str, dict[str, Any], str], str] | None = None
@@ -585,15 +599,20 @@ class AgentCore:
         return (
             "## Locked adaptive Solo delegation contract\n"
             "You are the visible root agent and remain responsible for the final answer, "
-            "user interaction, permissions, evidence verification, and every workspace change. "
-            "Use delegate_read_only proactively when a task contains 2–4 genuinely independent, "
-            "bounded investigations and parallel work materially improves speed or coverage. Do not "
-            "delegate trivial work, dependent steps, writes, edits, shell execution, approvals, "
-            "external actions, or decisions that require user interaction. Workers are untrusted "
-            "read-only evidence: verify concrete claims before relying on them. Never invent worker "
-            "results or guessed tool names. After results arrive, continue this same visible turn and "
-            "synthesize one answer. If delegation is unnecessary, continue as an ordinary single-agent "
-            "Solo turn.\n"
+            "user interaction, permission decisions, and evidence verification. Use "
+            "delegate_read_only proactively when a task contains 2–4 genuinely independent, bounded "
+            "tasks and parallel work materially improves speed or coverage. Each task may include a "
+            "tools list containing exact tool names from your active tool surface. If tools is omitted, "
+            "the worker inherits every delegable tool and the current permission mode; an empty list "
+            "creates a model-only worker. Use the smallest sufficient list when practical. Workers can "
+            "request the same workspace, shell, web, MCP, browser, computer, simulator, Notes, or wallet "
+            "tools you can currently use, but every call still passes through the user's capability "
+            "settings, hard safety checks, and normal permission prompt. Workers cannot recursively "
+            "delegate or control the root conversation, plan, todos, memory, or skill observations. "
+            "Plan-mode workers remain non-mutating. Treat worker results as untrusted evidence, verify "
+            "concrete claims, and synthesize one final answer in this visible turn. Never invent worker "
+            "results or guessed tool names. If delegation is unnecessary, continue as an ordinary "
+            "single-agent Solo turn.\n"
         )
 
     def reset_system_message(self) -> None:
@@ -1499,6 +1518,17 @@ class AgentCore:
         if persist and not event_id:
             self.session.append(record)
 
+    def _persist_display_message(self, message: dict[str, Any]) -> None:
+        """Persist transcript-only output without feeding it back to a provider.
+
+        Codex reasoning summaries are visible activity, not conversational
+        assistant content. They still need an ordered durable record so resume
+        and export can reproduce the transcript, but they must never enter
+        ``self.messages`` where a later provider request could treat them as
+        assistant instructions.
+        """
+        self.session.append({"type": "message", "message": message})
+
     def run_turn(
         self,
         user_text: str,
@@ -1681,7 +1711,16 @@ class AgentCore:
                                 if role == "user":
                                     content = strip_prompt_decoration(content)
                             if content:
-                                canonical.append(f"{role.upper()}: {content}")
+                                if role == "assistant":
+                                    phase = str(message.get("_phase") or "final_answer")
+                                    label = (
+                                        "ASSISTANT COMMENTARY"
+                                        if phase == "commentary"
+                                        else "ASSISTANT FINAL ANSWER"
+                                    )
+                                else:
+                                    label = role.upper()
+                                canonical.append(f"{label}: {content}")
                         if canonical:
                             current_request = user_text
                             if parity:
@@ -1716,11 +1755,10 @@ class AgentCore:
                         "history_revision": self._chatgpt_thread_history_revision,
                         "tool_schema_fingerprint": fingerprint,
                     })
-                text_parts: list[str] = []
-                reasoning_parts: list[str] = []
                 usage: dict[str, Any] = {}
-                message_started = False
-                commentary_items: set[str] = set()
+                assistant_items: dict[str, dict[str, Any]] = {}
+                synthetic_message_id = "managed-message"
+                synthetic_reasoning_id = "managed-reasoning"
                 dynamic_call_count = 0
                 dynamic_call_limit = min(
                     self.max_iterations,
@@ -1728,44 +1766,227 @@ class AgentCore:
                     if model_call_limit is not None else self.max_iterations,
                 )
 
+                def normalized_phase(value: Any) -> str:
+                    return (
+                        "commentary"
+                        if str(value or "").lower().startswith("commentary")
+                        else "final_answer"
+                    )
+
+                def item_identifier(params: dict[str, Any], fallback: str) -> str:
+                    value = params.get("itemId") or params.get("item_id")
+                    return str(value) if value else fallback
+
+                def summary_index(params: dict[str, Any]) -> int:
+                    try:
+                        return max(int(params.get("summaryIndex") or 0), 0)
+                    except (TypeError, ValueError):
+                        return 0
+
+                def ensure_item(
+                    item_id: str,
+                    kind: str,
+                    *,
+                    phase: str | None = None,
+                ) -> dict[str, Any]:
+                    state = assistant_items.get(item_id)
+                    if state is None:
+                        state = {
+                            "id": item_id,
+                            "kind": kind,
+                            "phase": normalized_phase(phase) if kind == "message" else None,
+                            "text": "",
+                            "sections": [],
+                            "ended": False,
+                        }
+                        assistant_items[item_id] = state
+                        started_event: dict[str, Any] = {
+                            "type": "assistant_item_start",
+                            "item_id": item_id,
+                            "kind": kind,
+                        }
+                        if kind == "message":
+                            started_event["phase"] = state["phase"]
+                        self._emit(started_event)
+                    elif kind == "message" and phase:
+                        state["phase"] = normalized_phase(phase)
+                    return state
+
+                def message_text(item: dict[str, Any], fallback: str) -> str:
+                    direct = item.get("text")
+                    if isinstance(direct, str):
+                        return direct
+                    content = item.get("content")
+                    if isinstance(content, list):
+                        return "".join(
+                            str(part.get("text") or "")
+                            for part in content
+                            if isinstance(part, dict)
+                            and str(part.get("type") or "") in {
+                                "output_text", "outputText", "text",
+                            }
+                        )
+                    return fallback
+
+                def completed_reasoning_sections(
+                    item: dict[str, Any], fallback: list[str]
+                ) -> list[str]:
+                    summary = item.get("summary")
+                    if not isinstance(summary, list):
+                        return fallback
+                    sections: list[str] = []
+                    for part in summary:
+                        if isinstance(part, str):
+                            sections.append(part)
+                        elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                            sections.append(part["text"])
+                    return sections
+
+                def finish_message(
+                    state: dict[str, Any],
+                    *,
+                    authoritative_text: str | None = None,
+                    phase: str | None = None,
+                ) -> None:
+                    if state["ended"]:
+                        return
+                    if authoritative_text is not None:
+                        state["text"] = authoritative_text
+                    if phase:
+                        state["phase"] = normalized_phase(phase)
+                    state["ended"] = True
+                    self._emit({
+                        "type": "assistant_item_end",
+                        "item_id": state["id"],
+                        "kind": "message",
+                        "phase": state["phase"],
+                        "text": state["text"],
+                    })
+                    self._add_message({
+                        "role": "assistant",
+                        "content": state["text"],
+                        "_phase": state["phase"],
+                        "_item_id": state["id"],
+                    })
+
+                def finish_reasoning(
+                    state: dict[str, Any],
+                    *,
+                    authoritative_sections: list[str] | None = None,
+                ) -> None:
+                    if state["ended"]:
+                        return
+                    if authoritative_sections is not None:
+                        state["sections"] = authoritative_sections
+                    sections = [str(value) for value in state["sections"] if str(value)]
+                    state["ended"] = True
+                    self._emit({
+                        "type": "assistant_item_end",
+                        "item_id": state["id"],
+                        "kind": "reasoning",
+                        "sections": sections,
+                    })
+                    if sections:
+                        self._persist_display_message({
+                            "role": "assistant",
+                            "content": "",
+                            "_display_only": True,
+                            "_item_id": state["id"],
+                            "_display_reasoning_sections": sections,
+                            # Older clients still understand the flattened
+                            # compatibility field, with real section spacing.
+                            "_display_reasoning": "\n\n".join(sections),
+                        })
+
                 def handle_event(event: dict[str, Any]) -> None:
-                    nonlocal usage, message_started
+                    nonlocal usage
                     method = str(event.get("method") or "")
                     params = event.get("params")
                     if not isinstance(params, dict):
                         return
-                    if parity and method == "item/started":
-                        # Native-prompted models narrate mid-turn progress as
-                        # commentary-phase agent messages; remember those item
-                        # ids so their deltas join the thinking stream rather
-                        # than the answer.
+                    if method == "item/started":
                         item = params.get("item")
-                        if (
-                            isinstance(item, dict)
-                            and str(item.get("phase") or "").lower().startswith("commentary")
-                            and isinstance(item.get("id"), str)
-                        ):
-                            commentary_items.add(item["id"])
+                        if not isinstance(item, dict):
+                            return
+                        raw_kind = str(item.get("type") or "")
+                        item_id = str(item.get("id") or "")
+                        if not item_id:
+                            return
+                        if raw_kind in {"agentMessage", "message"}:
+                            ensure_item(item_id, "message", phase=str(item.get("phase") or ""))
+                        elif raw_kind == "reasoning":
+                            ensure_item(item_id, "reasoning")
                     elif method == "item/agentMessage/delta":
                         delta = params.get("delta")
                         if isinstance(delta, str) and delta:
-                            if str(params.get("itemId") or "") in commentary_items:
-                                reasoning_parts.append(delta)
-                                self._emit({"type": "thinking", "text": delta})
+                            item_id = item_identifier(params, synthetic_message_id)
+                            state = ensure_item(item_id, "message")
+                            if state["ended"]:
                                 return
-                            if not message_started:
-                                message_started = True
-                                self._emit({"type": "message_start"})
-                            text_parts.append(delta)
-                            self._emit({"type": "token", "text": delta})
+                            state["text"] += delta
+                            self._emit({
+                                "type": "assistant_item_delta",
+                                "item_id": item_id,
+                                "kind": "message",
+                                "phase": state["phase"],
+                                "text": delta,
+                            })
+                    elif method == "item/reasoning/summaryPartAdded":
+                        item_id = item_identifier(params, synthetic_reasoning_id)
+                        state = ensure_item(item_id, "reasoning")
+                        if state["ended"]:
+                            return
+                        index = summary_index(params)
+                        while len(state["sections"]) <= index:
+                            state["sections"].append("")
                     elif method == "item/reasoning/summaryTextDelta":
                         # App Server distinguishes the user-visible reasoning
                         # summary from raw private reasoning. Only the summary
                         # is allowed into Locus events and transcripts.
                         delta = params.get("delta")
                         if isinstance(delta, str) and delta:
-                            reasoning_parts.append(delta)
-                            self._emit({"type": "thinking", "text": delta})
+                            item_id = item_identifier(params, synthetic_reasoning_id)
+                            state = ensure_item(item_id, "reasoning")
+                            if state["ended"]:
+                                return
+                            index = summary_index(params)
+                            while len(state["sections"]) <= index:
+                                state["sections"].append("")
+                            state["sections"][index] += delta
+                            self._emit({
+                                "type": "assistant_item_delta",
+                                "item_id": item_id,
+                                "kind": "reasoning",
+                                "section_index": index,
+                                "text": delta,
+                            })
+                    elif method == "item/completed":
+                        item = params.get("item")
+                        if not isinstance(item, dict):
+                            return
+                        raw_kind = str(item.get("type") or "")
+                        item_id = str(item.get("id") or "")
+                        if raw_kind in {"agentMessage", "message"}:
+                            item_id = item_id or synthetic_message_id
+                            state = ensure_item(
+                                item_id,
+                                "message",
+                                phase=str(item.get("phase") or ""),
+                            )
+                            finish_message(
+                                state,
+                                authoritative_text=message_text(item, state["text"]),
+                                phase=str(item.get("phase") or state["phase"]),
+                            )
+                        elif raw_kind == "reasoning":
+                            item_id = item_id or synthetic_reasoning_id
+                            state = ensure_item(item_id, "reasoning")
+                            finish_reasoning(
+                                state,
+                                authoritative_sections=completed_reasoning_sections(
+                                    item, state["sections"]
+                                ),
+                            )
                     elif method == "thread/tokenUsage/updated":
                         candidate = params.get("tokenUsage")
                         if isinstance(candidate, dict):
@@ -1821,14 +2042,27 @@ class AgentCore:
                     event_handler=handle_event,
                     should_interrupt=self._interrupt.is_set,
                 )
-                answer = "".join(text_parts)
-                if message_started:
-                    self._emit({"type": "message_end", "content": answer})
-                assistant_message: dict[str, Any] = {"role": "assistant", "content": answer}
-                reasoning = "".join(reasoning_parts).strip()
-                if reasoning:
-                    assistant_message["_display_reasoning"] = reasoning
-                self._add_message(assistant_message)
+                # A disconnect can omit the terminal notification after valid
+                # deltas. Finalize those partial items in first-seen order so
+                # the transcript never keeps a dangling streaming row.
+                for state in assistant_items.values():
+                    if state["ended"]:
+                        continue
+                    if state["kind"] == "message":
+                        finish_message(state)
+                    else:
+                        finish_reasoning(state)
+                if not any(
+                    state["kind"] == "message" for state in assistant_items.values()
+                ):
+                    # Preserve the old conversational invariant used by worker
+                    # result collection: each successful model call owns an
+                    # assistant record even when the provider returned empty.
+                    self._add_message({
+                        "role": "assistant",
+                        "content": "",
+                        "_phase": "final_answer",
+                    })
                 last = usage.get("last") if isinstance(usage.get("last"), dict) else {}
                 prompt = int(last.get("inputTokens") or 0)
                 completion = int(last.get("outputTokens") or 0)
@@ -2660,9 +2894,92 @@ class AgentCore:
 
     # ------------------------------------------------------------------ tools
 
-    def _run_tool_call(self, tc: ToolCall, decider: PermissionDecider | None) -> str:
+    def solo_worker_tool_schemas(self) -> list[dict[str, Any]]:
+        """Snapshot the delegable root tool surface for the active turn."""
+        parity = self.chatgpt_parity_active(True)
+        schemas = (
+            self.tool_registry.parity_schemas(plan_mode=False)
+            if parity else self.tool_registry.schemas()
+        )
+        result: list[dict[str, Any]] = []
+        for schema in schemas:
+            function = schema.get("function") if isinstance(schema, dict) else None
+            wire_name = str(function.get("name") or "") if isinstance(function, dict) else ""
+            canonical, _ = parity_to_canonical(wire_name, {}) if parity else (wire_name, {})
+            if not wire_name or canonical in _SOLO_ROOT_ONLY_TOOLS:
+                continue
+            if self.agent_mode == "plan" and not self.tool_registry.is_read_only_tool(canonical):
+                continue
+            result.append(schema)
+        return result
+
+    def solo_worker_virtual_tools(self) -> set[str]:
+        """Provider-native capabilities that are not dynamic function schemas."""
+        policy = self.agent_configuration.capability_policy
+        if (
+            self.provider == "chatgpt"
+            and bool(self.config.get("chatgpt_web_search", False))
+            and bool(policy.network)
+        ):
+            return {"web_search"}
+        return set()
+
+    def solo_worker_tool_is_read_only(self, wire_name: str) -> bool:
+        canonical, _ = (
+            parity_to_canonical(wire_name, {})
+            if self.chatgpt_parity_active(True) else (wire_name, {})
+        )
+        return self.tool_registry.is_read_only_tool(canonical)
+
+    def solo_worker_tool_is_parallel_safe(self, wire_name: str) -> bool:
+        canonical, _ = (
+            parity_to_canonical(wire_name, {})
+            if self.chatgpt_parity_active(True) else (wire_name, {})
+        )
+        return self.tool_registry.is_parallel_safe_tool(canonical)
+
+    def run_solo_worker_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        call_id: str,
+        decider: PermissionDecider | None,
+        *,
+        event_context: dict[str, Any],
+        execution_lock: Any | None,
+    ) -> str:
+        """Execute an inherited worker call through the root authority path."""
+        available = {
+            str(schema.get("function", {}).get("name") or "")
+            for schema in self.solo_worker_tool_schemas()
+            if isinstance(schema, dict) and isinstance(schema.get("function"), dict)
+        }
+        if name not in available:
+            return "Error: this tool is no longer available to the root agent."
+        if self.chatgpt_parity_active(True):
+            name, arguments = parity_to_canonical(name, arguments)
+        return self._run_tool_call(
+            ToolCall(name=name, arguments=arguments, call_id=call_id),
+            decider,
+            event_context=event_context,
+            execution_lock=execution_lock,
+            track_active=False,
+        )
+
+    def _run_tool_call(
+        self,
+        tc: ToolCall,
+        decider: PermissionDecider | None,
+        *,
+        event_context: dict[str, Any] | None = None,
+        execution_lock: Any | None = None,
+        track_active: bool = True,
+    ) -> str:
         call_id = uuid.uuid4().hex[:10]
         summary, detail = build_preview(tc.name, tc.arguments, self.tool_ctx)
+        worker_label = str((event_context or {}).get("agent_name") or "").strip()
+        if worker_label:
+            summary = f"{worker_label}: {summary}"
         info = self.tool_registry.tool_info(tc.name) or {"origin": "builtin"}
         event_info = {
             key: value for key, value in info.items()
@@ -2672,6 +2989,12 @@ class AgentCore:
             }
             and value is not None
         }
+        if event_context:
+            event_info.update({
+                key: value for key, value in event_context.items()
+                if key in {"node_id", "agent_id", "agent_name", "job_id", "label"}
+                and value is not None
+            })
         schema_digest = str(info.get("schema_digest") or "")
         server_fingerprint = str(info.get("server_fingerprint") or "")
         permission_material = f"{server_fingerprint}:{schema_digest}".strip(":")
@@ -2760,49 +3083,61 @@ class AgentCore:
                     **event_info,
                 })
                 return result
-        self.active_tool_call_id = call_id
-        try:
-            if info.get("origin") == "native":
-                result = (
-                    self.computer_executor(tc.name, tc.arguments, call_id)
-                    if self.computer_executor is not None
-                    else "Error: native computer control is unavailable."
-                )
-            elif info.get("origin") == "browser":
-                # Checked here rather than relying on schema omission: a team's
-                # writer route swaps the access ceiling without unwiring the
-                # executor, so a read-only agent could otherwise guess its way
-                # to a mutating tool.
-                if not self.tool_registry.browser_tool_allowed(tc.name):
-                    result = "Error: this agent is read-only and cannot use that browser tool."
-                elif self.browser_executor is None:
-                    result = "Error: the browser is unavailable."
+        with execution_lock if execution_lock is not None else nullcontext():
+            if track_active:
+                self.active_tool_call_id = call_id
+            try:
+                if info.get("origin") == "native":
+                    result = (
+                        self.computer_executor(tc.name, tc.arguments, call_id)
+                        if self.computer_executor is not None
+                        else "Error: native computer control is unavailable."
+                    )
+                elif info.get("origin") == "simulator":
+                    # A guessed mutating name must still respect a reviewer or
+                    # dispatcher route's read-only ceiling.
+                    if not self.tool_registry.simulator_tool_allowed(tc.name):
+                        result = "Error: this agent is read-only and cannot use that simulator tool."
+                    elif self.simulator_executor is None:
+                        result = "Error: iOS Simulator control is unavailable."
+                    else:
+                        result = self.simulator_executor(tc.name, tc.arguments, call_id)
+                elif info.get("origin") == "browser":
+                    # Checked here rather than relying on schema omission: a team's
+                    # writer route swaps the access ceiling without unwiring the
+                    # executor, so a read-only agent could otherwise guess its way
+                    # to a mutating tool.
+                    if not self.tool_registry.browser_tool_allowed(tc.name):
+                        result = "Error: this agent is read-only and cannot use that browser tool."
+                    elif self.browser_executor is None:
+                        result = "Error: the browser is unavailable."
+                    else:
+                        result = self.browser_executor(tc.name, tc.arguments, call_id)
+                elif info.get("origin") == "notes":
+                    if not self.tool_registry.notes_tool_allowed(tc.name):
+                        result = "Error: this agent is read-only and cannot update Notes."
+                    elif self.notes_executor is None:
+                        result = "Error: Notes are unavailable."
+                    else:
+                        result = self.notes_executor(tc.name, tc.arguments, call_id)
+                elif info.get("origin") == "wallet":
+                    # Schema omission is not the security boundary: a guessed tool
+                    # name must still pass the native-broker and access-ceiling gate.
+                    if not self.tool_registry.wallet_tool_allowed(tc.name):
+                        result = "Error: this agent cannot use that wallet tool."
+                    elif self.wallet_executor is None:
+                        result = "Error: the Locus Vault is unavailable."
+                    else:
+                        result = self.wallet_executor(tc.name, tc.arguments, call_id)
                 else:
-                    result = self.browser_executor(tc.name, tc.arguments, call_id)
-            elif info.get("origin") == "notes":
-                if not self.tool_registry.notes_tool_allowed(tc.name):
-                    result = "Error: this agent is read-only and cannot update Notes."
-                elif self.notes_executor is None:
-                    result = "Error: Notes are unavailable."
-                else:
-                    result = self.notes_executor(tc.name, tc.arguments, call_id)
-            elif info.get("origin") == "wallet":
-                # Schema omission is not the security boundary: a guessed tool
-                # name must still pass the native-broker and access-ceiling gate.
-                if not self.tool_registry.wallet_tool_allowed(tc.name):
-                    result = "Error: this agent cannot use that wallet tool."
-                elif self.wallet_executor is None:
-                    result = "Error: the Locus Vault is unavailable."
-                else:
-                    result = self.wallet_executor(tc.name, tc.arguments, call_id)
-            else:
-                result = (
-                    execute_tool(tc.name, tc.arguments, self.tool_ctx)
-                    if info.get("origin") == "builtin"
-                    else self.tool_registry.execute(tc.name, tc.arguments, self.tool_ctx)
-                )
-        finally:
-            self.active_tool_call_id = ""
+                    result = (
+                        execute_tool(tc.name, tc.arguments, self.tool_ctx)
+                        if info.get("origin") == "builtin"
+                        else self.tool_registry.execute(tc.name, tc.arguments, self.tool_ctx)
+                    )
+            finally:
+                if track_active:
+                    self.active_tool_call_id = ""
         ok = not result.startswith("Error")
         self._emit({
             "type": "tool_result",
@@ -3059,8 +3394,25 @@ class AgentCore:
             if role == "user" and run_id:
                 item["run_id"] = run_id
             if role == "assistant":
+                phase = str(m.get("_phase") or "")[:32]
+                item_id = str(m.get("_item_id") or "")[:256]
+                if phase:
+                    item["phase"] = phase
+                if item_id:
+                    item["item_id"] = item_id
                 # Resume only provider-supplied visible reasoning. Signatures
                 # and redacted-thinking payloads are intentionally omitted.
+                sections: list[str] = []
+                remaining = 20_000
+                for raw_section in m.get("_display_reasoning_sections") or []:
+                    if remaining <= 0:
+                        break
+                    section = str(raw_section)[:remaining]
+                    if section:
+                        sections.append(section)
+                        remaining -= len(section)
+                if sections:
+                    item["reasoning_sections"] = sections
                 reasoning = str(m.get("_display_reasoning") or "")
                 if not reasoning:
                     reasoning = str(m.get("reasoning_content") or "")
@@ -3101,7 +3453,10 @@ class AgentCore:
                 self.reload_context()
             except OSError:
                 pass
-        self.messages = [self.system_message()] + messages
+        # Transcript-only reasoning records retain their exact position for
+        # the UI, but never become conversational input after resume.
+        conversational = [m for m in messages if not m.get("_display_only")]
+        self.messages = [self.system_message()] + conversational
         self._clear_chatgpt_thread()
         if self.provider == "chatgpt":
             marker = SessionStore.chatgpt_thread_state(path)

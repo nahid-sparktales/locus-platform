@@ -5,6 +5,9 @@ describe("isolated browser bridge", () => {
   it("contains credential and payment protections", () => {
     expect(browserBridgeSource).toContain("protected credential or payment data");
     expect(browserBridgeSource).toContain("one-time-code");
+    expect(browserBridgeSource).toContain("protectedCategory");
+    expect(browserBridgeSource).toContain("securityCode");
+    expect(browserBridgeSource).toContain("paymentCard");
     expect(browserBridgeSource).toContain("data-locus-protected-cover");
     expect(browserBridgeSource).toContain("focusedSensitive");
     expect(browserBridgeSource).toContain("protectedRects");
@@ -28,8 +31,11 @@ describe("isolated browser bridge", () => {
   });
 
   it("escapes invocation values as JSON", () => {
-    const call = bridgeInvocation.setValue("e1-'", "hello </script>");
+    const call = bridgeInvocation.setValue(
+      "e1-'", "hello </script>", ["password", "paymentCard"],
+    );
     expect(call).toContain(JSON.stringify("e1-'"));
     expect(call).toContain(JSON.stringify("hello </script>"));
+    expect(call).toContain(JSON.stringify(["password", "paymentCard"]));
   });
 });

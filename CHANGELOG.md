@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+Synchronizes the shared Python runtime with Locus's modular backend ownership,
+adaptive agent execution, structured transcript output, and current wallet
+workflows. The wallet handshake now carries a validated least-authority signer
+capability instead of trusting a boolean, and transaction preparation accepts
+semantic Sepolia actions rather than raw caller-defined payloads.
+
+Adds independently granted browser Autofill categories across the Python,
+JSON Schema, TypeScript, Swift, fixture, and isolated-world bridge surfaces.
+Password and payment-card access is shaped out of model schemas unless granted;
+card security codes and one-time codes remain blocked. Existing bounded live
+browser context, portable memory, cited research, signed component, speech, and
+semantic-runtime contracts remain intact after the backend modularization.
+
 ## 0.1.0-canary.6 — 2026-08-27
 
 Synchronizes the shared agent runtime with Locus 2.0 development: Codex-native

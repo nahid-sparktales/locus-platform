@@ -22,7 +22,12 @@
       "properties": {
         "type": { "const": "set_browser_control" },
         "enabled": { "type": "boolean" },
-        "history_enabled": { "type": "boolean" }
+        "history_enabled": { "type": "boolean" },
+        "autofill_categories": {
+          "type": "array",
+          "items": { "enum": ["password", "contact", "paymentCard"] },
+          "uniqueItems": true
+        }
       },
       "additionalProperties": false
     },
@@ -35,6 +40,7 @@
         "tool": {
           "enum": [
             "browser_history",
+            "browser_autofill",
             "browser_read_page", "browser_get_text", "browser_find",
             "browser_navigate", "browser_tabs", "browser_input",
             "browser_screenshot", "browser_wait_for", "browser_console",
@@ -80,10 +86,46 @@
     },
     "setWalletControl": {
       "type": "object",
-      "required": ["type", "enabled"],
+      "required": ["type"],
       "properties": {
         "type": { "const": "set_wallet_control" },
-        "enabled": { "type": "boolean" }
+        "capability": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": [
+                "protocol_version", "signer_state", "session_id",
+                "supported_chains", "allowed_operations"
+              ],
+              "properties": {
+                "protocol_version": { "const": 1 },
+                "signer_state": { "const": "unlocked" },
+                "session_id": { "type": "string", "minLength": 1 },
+                "supported_chains": {
+                  "type": "array", "minItems": 1, "uniqueItems": true,
+                  "items": { "type": "string", "pattern": "^[^:]+:.+$" }
+                },
+                "allowed_operations": {
+                  "type": "array", "minItems": 1, "uniqueItems": true,
+                  "items": {
+                    "enum": [
+                      "wallet_list_accounts", "wallet_get_balance", "wallet_get_activity",
+                      "wallet_prepare_transaction", "wallet_simulate_transaction",
+                      "wallet_execute_transaction", "wallet_lock"
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "enabled": {
+          "type": "boolean",
+          "deprecated": true,
+          "description": "Legacy fail-closed field. It can revoke wallet access but never enables tools without capability."
+        }
       },
       "additionalProperties": false
     },

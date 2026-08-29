@@ -47,6 +47,7 @@
     "browser.local-encrypted-transcripts",
     "browser.private-semantic-recall",
     "browser.history-explicit-opt-in",
+    "browser.autofill-explicit-model-grants",
     "browser.cited-research-boards",
     "browser.ai-tab-steward",
     "browser.two-page-split-view",
