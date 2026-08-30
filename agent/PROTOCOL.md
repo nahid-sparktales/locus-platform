@@ -276,12 +276,14 @@ The `chatgpt` variant requires `account_id`, with optional `account_label` and
 primary service's bundled Codex App Server and never falls back to `remote`.
 It also accepts three optional settings with "missing means keep" semantics,
 so an older client re-selecting the account never resets them: `native_mode`
-(bool, default true), `web_search` (bool, default false), and
+(bool, default true when the field is absent — note that Locus itself always
+sends the field, and sends `false` for newly created accounts),
+`web_search` (bool, default false), and
 `reasoning_effort` (string, `""` = the model's default, applied per turn —
 changing it never restarts the helper thread). `GET` echoes them back as
 `chatgpt_native_mode`, `chatgpt_web_search`, and `chatgpt_reasoning_effort`.
 
-With `native_mode` on (Codex-native parity, the default), interactive solo
+With `native_mode` on (Codex-native parity, the wire default), interactive solo
 Work/Plan/Build turns run under the model's own Codex base prompt instead of
 the Locus system prompt: `thread/start` omits `baseInstructions` and
 `personality`, AGENTS.md rides in `developerInstructions`, the environment
@@ -670,7 +672,7 @@ Endpoint: `/ws/chat`.
 
 | `type` | Extra fields | Effect |
 |---|---|---|
-| `user_message` | `text: string`, optional `mode: "ask" \| "work" \| "plan" \| "build"`, optional versioned `agent_config`, optional `attachments`, optional `browser_context`, optional `portable_memory`, optional `team` manifest | Runs one solo or dispatcher-led team turn. `browser_context` and `portable_memory` are bounded, ephemeral, untrusted evidence and are not persisted with the visible message. `agent_config` controls editable display identity, description, response style, custom/per-mode guidance, narrowing capability switches, memory policy, and runtime limits. It is snapshotted for the complete turn; factual provider/model identity, safety rules, permission policy, and mode boundaries remain locked runtime layers. Existing clients may omit it. A team manifest contains one explicit team, its enabled profiles and ephemeral routes, optional forced member, and bounded budgets; each profile may carry the same additive `behavior` object. Credentials are accepted only in memory and are never echoed or persisted. Slash commands and Chat mode reject team routing. Image `attachments` are valid in **every** mode: PNG/JPEG/GIF/WebP, at most 10 per message, 15 MB per image, 25 MB in total, base64 `data` with a `mime_type` and optional `name`. They ride the turn in memory only — the persisted session record keeps the text and attachment names, never image bytes, so a restored or resumed conversation carries no images. On a team turn the images reach the dispatcher and the first coding job's first slice; specialists, reviewers, and synthesis receive text evidence only, and the server emits a `note` event saying so before dispatch. A provider that explicitly rejects image input triggers one automatic retry with the images stripped from history, announced by a `note`. |
+| `user_message` | `text: string`, optional `mode: "ask" \| "work" \| "plan" \| "grill"` (`"build"`, the retired GSD mode, stays accepted so older clients and stored schedules keep working), optional versioned `agent_config`, optional `attachments`, optional `browser_context`, optional `portable_memory`, optional `team` manifest | Runs one solo or dispatcher-led team turn. `browser_context` and `portable_memory` are bounded, ephemeral, untrusted evidence and are not persisted with the visible message. `agent_config` controls editable display identity, description, response style, custom/per-mode guidance, narrowing capability switches, memory policy, and runtime limits. It is snapshotted for the complete turn; factual provider/model identity, safety rules, permission policy, and mode boundaries remain locked runtime layers. Existing clients may omit it. A team manifest contains one explicit team, its enabled profiles and ephemeral routes, optional forced member, and bounded budgets; each profile may carry the same additive `behavior` object. Credentials are accepted only in memory and are never echoed or persisted. Slash commands and Chat mode reject team routing. Image `attachments` are valid in **every** mode: PNG/JPEG/GIF/WebP, at most 10 per message, 15 MB per image, 25 MB in total, base64 `data` with a `mime_type` and optional `name`. They ride the turn in memory only — the persisted session record keeps the text and attachment names, never image bytes, so a restored or resumed conversation carries no images. On a team turn the images reach the dispatcher and the first coding job's first slice; specialists, reviewers, and synthesis receive text evidence only, and the server emits a `note` event saying so before dispatch. A provider that explicitly rejects image input triggers one automatic retry with the images stripped from history, announced by a `note`. |
 | `research_board_request` | `request_id: string`, `prompt: string`, `format: "comparison" \| "brief" \| "evidence"`, `sources: object[]` | Runs one read-only research synthesis over 1–10 explicitly shared, content-hashed sources and their stable passage IDs. Source text is bounded to 120,000 characters and output citations are validated before the result is emitted. |
 | `permission_decision` | `request_id: string`, `decision: "once" \| "always" \| "deny"` | Answers a `permission_request`. Unknown/invalid values are treated as `deny`. Late answers are ignored. |
 | `interrupt` | — | Soft-interrupts the current turn: streaming stops after the current chunk, pending permission waits are denied, turn ends with `turn_done {reason: "interrupted"}`. Safe to send when idle. |
@@ -846,6 +848,31 @@ plan-decision boundary, not a general progress event.
 
 The client presents Proceed, Revise, and Cancel only after the surrounding Plan
 turn completes successfully. Reconnection replay preserves this event's order.
+
+### `question_ready`
+
+Emitted after the permission-free `ask_user_question` tool succeeds. The tool
+does not block the turn: the model is told to end its turn, and the client
+presents the question popup only after the surrounding turn completes with
+`reason: "complete"`. The user's answer returns as an ordinary `user_message`
+— there is no dedicated reply message. Reconnection replay preserves this
+event's order.
+
+```json
+{ "type": "question_ready", "question": {
+  "id": "8f38c1d2d9a04bc1", "title": "Reddit scope",
+  "question": "Should latest posts mean the site-wide feed or one subreddit?",
+  "options": [
+    { "label": "Site-wide /new feed", "detail": "" },
+    { "label": "One subreddit", "detail": "Passed as an argument" }
+  ],
+  "recommended": "Site-wide /new feed"
+} }
+```
+
+`options` may be empty; the client always offers a free-text answer. `recommended`
+is the model's suggested answer — an option label when it matches one, freeform
+otherwise.
 
 ### `steer_ack` / `steer_applied`
 
@@ -1062,8 +1089,9 @@ or `tool_result` for the same call.
 ```
 
 `id` (10 hex chars) correlates this call across all later events. `auto` is true
-when the tool runs without asking (safe tools `read_file`/`glob`/`grep`/`list_dir`,
-tools previously allowed with `always`, or `--dangerously-skip-permissions`).
+when the tool runs without asking (safe tools `read_file`/`glob`/`grep`/`list_dir`/
+`ask_user_question`, tools previously allowed with `always`, or
+`--dangerously-skip-permissions`).
 
 ### `permission_request`
 Only when `auto` is false. The turn blocks until a `permission_decision` arrives.
@@ -1117,7 +1145,15 @@ The terminal also carries this turn's spend and provenance — `prompt_tokens`
 and `completion_tokens` (deltas for the turn, not conversation totals),
 `provider`, `model`, `account_label` (empty for local Ollama),
 `workspace_root`, and `session_id`. The fields are additive; old clients
-ignore them. The server persists solo turns with nonzero tokens into the run
+ignore them.
+`tool_steps` counts the tools this turn actually ran, which is the number a
+reader recognises as "how much work happened". It exists because `model_calls`
+does not mean the same thing on both routes: the local loop makes one provider
+request per iteration, while a ChatGPT App Server turn is a single thread call
+that may run twenty tools inside it. On that route `model_calls` is derived from
+the helper's per-call `thread/tokenUsage/updated` reports, and token deltas are
+summed across them rather than read from the final snapshot — reading only the
+last one billed a whole turn at one request's cost. The server persists solo turns with nonzero tokens into the run
 store's `turn_usage` table for `GET /api/usage/summary`; orchestrated runs
 account usage in their own run records instead.
 A `session_info` event follows immediately.
