@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+Synchronizes the shared runtime with Locus 2.1.0: Grill mode replaces the
+retired GSD build mode in the protocol (the old value stays accepted for older
+clients and stored schedules), agent questions surface as structured
+question-prompt events, run overviews scope their file/step/model readouts to
+the selected run's own events, turns close with a written answer, ChatGPT turn
+usage is scoped to the turn, spawn sites sanitize the environment and keep
+proxy credentials out of helper processes, and produced-file reporting feeds
+the Outputs surface. Platform-only contracts — live browser context, portable
+memory, cited research, wallet broker, speech, and the semantic runtime —
+are preserved through the merge and remain intact.
+
 Synchronizes the shared Python runtime with Locus's modular backend ownership,
 adaptive agent execution, structured transcript output, and current wallet
 workflows. The wallet handshake now carries a validated least-authority signer

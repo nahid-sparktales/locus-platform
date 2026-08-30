@@ -32,7 +32,7 @@ from ollama_code.continuity import ContinuityStore
 from ollama_code.core import AgentCore
 from ollama_code.ollama import ChatResponse, OllamaError, process_chunk
 from ollama_code.orchestration import AgentResult, TeamOrchestrator
-from ollama_code.permissions import PermissionManager, build_preview
+from ollama_code.permissions import PermissionManager, build_preview, file_effects
 from ollama_code.render import ThinkFilter, strip_think
 from ollama_code.sessions import SessionMeta, SessionStore, strip_prompt_decoration
 from ollama_code.tools import ToolContext, execute_tool
@@ -579,6 +579,55 @@ def test_edit_preview_discloses_replace_all():
     )
     assert "every occurrence" in summary
     assert plain  # unchanged behavior for the single-replacement case
+
+
+def test_file_effects_separates_a_new_file_from_an_overwrite(ctx, tmp_path):
+    """The GUI cannot tell these apart from the result string, but the
+    arguments can — as long as they are read before the write happens."""
+    (tmp_path / "existing.md").write_text("old")
+
+    assert file_effects("write_file", {"path": "report.pdf", "content": "x"}, ctx) == [
+        {"path": "report.pdf", "effect": "create"}
+    ]
+    assert file_effects("write_file", {"path": "existing.md", "content": "x"}, ctx) == [
+        {"path": "existing.md", "effect": "edit"}
+    ]
+    assert file_effects("edit_file", {"path": "existing.md"}, ctx) == [
+        {"path": "existing.md", "effect": "edit"}
+    ]
+
+
+def test_file_effects_maps_patch_add_modify_and_delete(ctx, tmp_path):
+    (tmp_path / "changed.txt").write_text("one\n")
+    (tmp_path / "gone.txt").write_text("bye\n")
+    patch = (
+        "*** Begin Patch\n"
+        "*** Add File: made.txt\n"
+        "+new\n"
+        "*** Update File: changed.txt\n"
+        "@@\n"
+        "-one\n"
+        "+two\n"
+        "*** Delete File: gone.txt\n"
+        "*** End Patch"
+    )
+
+    assert file_effects("apply_patch", {"input": patch}, ctx) == [
+        {"path": "made.txt", "effect": "create"},
+        {"path": "changed.txt", "effect": "edit"},
+        {"path": "gone.txt", "effect": "delete"},
+    ]
+
+
+def test_file_effects_is_empty_for_shell_and_read_only_tools(ctx):
+    """A command's arguments say nothing about what it writes.
+
+    Guessing from its output is exactly how the old summary-scraping heuristic
+    went wrong; the workspace watcher covers this case instead.
+    """
+    assert file_effects("bash", {"command": "python make_report.py"}, ctx) == []
+    assert file_effects("read_file", {"path": "notes.md"}, ctx) == []
+    assert file_effects("browser_navigate", {"url": "https://example.com"}, ctx) == []
 
 
 def test_edit_preview_is_a_diff():
@@ -1467,6 +1516,28 @@ def test_provider_endpoint_carries_the_account_identity(client):
     assert kept["account_label"] == "Claude — Personal"
 
     assert client.post("/api/provider", json={"provider": "ollama"}).json()["account_label"] == ""
+
+
+def test_provider_endpoint_carries_the_reasoning_effort(client):
+    body = client.post("/api/provider", json={
+        "provider": "remote",
+        "base_url": "https://api.anthropic.com/v1",
+        "api_key": "sk-ant-secret",
+        "model": "claude-opus-5",
+        "auth_style": "anthropic",
+        "reasoning_effort": "high",
+    }).json()
+    assert body["remote_reasoning_effort"] == "high"
+
+    # "" is a real choice — the model's own default — and has to clear the
+    # previous one rather than read as an absent field.
+    cleared = client.post("/api/provider", json={
+        "provider": "remote",
+        "base_url": "https://api.anthropic.com/v1",
+        "model": "claude-opus-5",
+        "reasoning_effort": "",
+    }).json()
+    assert cleared["remote_reasoning_effort"] == ""
 
 
 # ------------------------------------------------------------------------ git
@@ -2693,7 +2764,9 @@ def test_reading_outside_the_workspace_requires_permission(tmp_path):
             tool_calls=[ToolCall("glob", {"pattern": str(secret.parent / "*")})],
             done=True,
         ),
-        ChatResponse(content_parts=["done"], done=True),
+        ChatResponse(content_parts=[
+            "Read `inside.txt`. Both paths outside the workspace were denied."
+        ], done=True),
     ])
     events = []
     core.on_event(events.append)
@@ -2803,6 +2876,52 @@ def test_websocket_set_cwd_and_model(client, tmp_path):
 
         ws.send_json({"type": "set_model", "model": "test-model"})
         assert any(e.get("type") == "session_info" for e in drain(ws))
+
+
+def test_websocket_set_model_accepts_a_chatgpt_plan_model(client):
+    """A ChatGPT-plan model is not an Ollama tag and must not be checked as one.
+
+    `core.client` stays an `OllamaClient` for the whole ChatGPT branch, so the
+    old installed-list check rejected every managed model — the session worked,
+    but switching between them raised "model '...' not installed".
+    """
+    svc = client.app.state.service
+    svc.core.provider = "chatgpt"
+    svc.core.host = "chatgpt://managed"
+    with client.websocket_connect("/ws/chat") as ws:
+        ws.receive_json()  # session_info
+        ws.send_json({"type": "set_model", "model": "gpt-5.6-sol"})
+        events = drain(ws)
+
+    assert [e for e in events if e.get("type") == "command_error"] == []
+    assert any(e.get("type") == "session_info" for e in events)
+    assert svc.core.model == "gpt-5.6-sol"
+    assert svc.core.config["chatgpt_model"] == "gpt-5.6-sol"
+
+
+def test_resolve_model_name_trusts_an_endpoint_that_does_not_list_models(tmp_path):
+    """`RemoteClient` answers /models-less providers with the configured model.
+
+    Validating against that list let a session switch to the model it was
+    already on and nothing else.
+    """
+    core = AgentCore(cwd=str(tmp_path), config={"model": "kimi-for-coding"})
+    core.provider = "remote"
+    core.client = FakeClient([])
+    core.client.lists_models = False
+    core.client.list_models = lambda: [{"name": "kimi-for-coding"}]
+
+    assert core.resolve_model_name("kimi-for-coding-highspeed") == "kimi-for-coding-highspeed"
+
+
+def test_resolve_model_name_still_rejects_an_uninstalled_ollama_model(tmp_path):
+    core = AgentCore(cwd=str(tmp_path), config={"model": "test-model"})
+    core.client = FakeClient([])
+
+    assert core.resolve_model_name("test-model") == "test-model"
+    # Ollama tags carry suffixes, so a prefix still resolves.
+    assert core.resolve_model_name("test") == "test-model"
+    assert core.resolve_model_name("llama3:70b") is None
 
 
 def test_websocket_state_commands_are_nonterminal_rejections_while_busy(client, tmp_path):
@@ -3337,6 +3456,43 @@ def test_run_turn_emits_streaming_and_turn_done(tmp_path):
     assert core.messages[-1]["content"] == "Hello world"
 
 
+def test_tool_result_reports_file_effects_only_when_the_call_succeeded(tmp_path):
+    """The Outputs list is built from these, so a refused call must not add to it."""
+    from ollama_code.ollama import ToolCall
+
+    core = _core(tmp_path, [
+        ChatResponse(tool_calls=[ToolCall("write_file", {
+            "path": "report.md", "content": "hello",
+        })], done=True),
+        ChatResponse(content_parts=["done"], done=True),
+    ])
+    core.perms.set_mode("bypass")
+    events = []
+    core.on_event(events.append)
+
+    core.run_turn("write it")
+
+    result = next(e for e in events if e["type"] == "tool_result")
+    assert result["ok"] is True
+    assert result["file_effects"] == [{"path": "report.md", "effect": "create"}]
+
+    denied = _core(tmp_path, [
+        ChatResponse(tool_calls=[ToolCall("write_file", {
+            "path": "refused.md", "content": "hello",
+        })], done=True),
+        ChatResponse(content_parts=["done"], done=True),
+    ])
+    denied_events = []
+    denied.on_event(denied_events.append)
+
+    denied.run_turn("write it", decider=lambda *args, **kwargs: "deny")
+
+    refusal = next(e for e in denied_events if e["type"] == "tool_result")
+    assert refusal["denied"] is True
+    assert "file_effects" not in refusal
+    assert not (tmp_path / "refused.md").exists()
+
+
 def test_run_turn_names_a_smaller_team_call_limit_instead_of_iteration_limit(tmp_path):
     from ollama_code.ollama import ToolCall
 
@@ -3379,6 +3535,92 @@ def test_submit_plan_emits_structured_plan_ready(tmp_path):
     assert ready["plan"]["title"] == "Smooth streaming"
     assert ready["plan"]["steps"] == ["Buffer tokens", "Detach user scrolling"]
     assert ready["plan"]["tests"] == ["Stream a 100 KB reply"]
+
+
+def test_ask_user_question_emits_structured_question_ready(tmp_path):
+    from ollama_code.ollama import ToolCall
+
+    responses = [
+        ChatResponse(tool_calls=[ToolCall("ask_user_question", {
+            "title": "Reddit scope",
+            "question": "Should latest posts mean the site-wide feed or one subreddit?",
+            # String options and object options both normalize.
+            "options": [
+                "Site-wide /new feed",
+                {"label": "One subreddit", "detail": "Passed as an argument"},
+            ],
+            "recommended": "Site-wide /new feed",
+        })], done=True),
+        ChatResponse(content_parts=["Question sent."], done=True),
+    ]
+    core = _core(tmp_path, responses)
+    events = []
+    core.on_event(events.append)
+
+    core.run_turn("stress-test the request")
+
+    ready = next(event for event in events if event["type"] == "question_ready")
+    question = ready["question"]
+    assert question["title"] == "Reddit scope"
+    assert question["question"].startswith("Should latest posts")
+    assert question["options"] == [
+        {"label": "Site-wide /new feed", "detail": ""},
+        {"label": "One subreddit", "detail": "Passed as an argument"},
+    ]
+    assert question["recommended"] == "Site-wide /new feed"
+    assert question["id"]
+    # Asking never prompts for permission.
+    assert not [event for event in events if event["type"] == "permission_request"]
+
+
+def test_ask_user_question_requires_a_question(tmp_path):
+    from ollama_code.ollama import ToolCall
+
+    responses = [
+        ChatResponse(tool_calls=[ToolCall("ask_user_question", {
+            "options": ["Yes", "No"],
+        })], done=True),
+        ChatResponse(content_parts=["No question."], done=True),
+    ]
+    core = _core(tmp_path, responses)
+    events = []
+    core.on_event(events.append)
+
+    core.run_turn("do the work")
+
+    assert not [event for event in events if event["type"] == "question_ready"]
+    result = next(event for event in events if event["type"] == "tool_result")
+    assert result["result"].startswith("Error:")
+
+
+def test_reset_conversation_clears_the_pending_question(tmp_path):
+    core = _core(tmp_path, [ChatResponse(content_parts=["ok"], done=True)])
+    core.tool_ctx.user_question = {"id": "abc", "question": "Stale?"}
+    core.reset_conversation()
+    assert core.tool_ctx.user_question is None
+
+
+def test_ask_user_question_suppresses_the_final_answer_nudge(tmp_path):
+    from ollama_code.ollama import ToolCall
+
+    responses = [
+        ChatResponse(tool_calls=[ToolCall("ask_user_question", {
+            "question": "Which feed should the script read?",
+        })], done=True),
+        ChatResponse(content_parts=[""], done=True),
+    ]
+    core = _core(tmp_path, responses)
+    events = []
+    core.on_event(events.append)
+
+    core.run_turn("do the work")
+
+    done = next(event for event in events if event["type"] == "turn_done")
+    assert done["reason"] == "complete"
+    # The question is the turn's deliverable. Without the guard the empty
+    # final text would trigger the nudge's extra tool-free model call, talking
+    # over the popup the model was just told to wait for.
+    assert core.client.calls == 2
 
 
 def test_local_and_inline_reasoning_are_resumable_without_provider_state(tmp_path):
@@ -4487,6 +4729,95 @@ def test_system_prompt_names_the_underlying_model(tmp_path):
     assert "call propose_memory once" in message
 
 
+def test_answer_contract_reaches_both_prompt_paths_but_not_just_chat(tmp_path):
+    """The screenshot case: ChatGPT-native sends no Locus system prompt at all."""
+    core = _core(tmp_path, [])
+
+    work = core.system_message()["content"]
+    assert "A bare list of names, paths, or values is not an answer" in work
+    assert "follows the locked answer contract" in work
+
+    assert "A bare list of names" not in core.system_message(mode="ask")["content"]
+
+    # The native-prompt route drops the system message entirely, so the
+    # contract has to ride in the developer layer or it never arrives.
+    assert "A bare list of names" in core._parity_developer_instructions()
+
+
+def test_a_turn_that_works_and_says_nothing_gets_one_written_answer(tmp_path):
+    from ollama_code.core import FINAL_ANSWER_NUDGE
+    from ollama_code.ollama import ToolCall
+
+    (tmp_path / "notes.md").write_text("hi")
+    listing = ChatResponse(tool_calls=[ToolCall("list_dir", {"path": "."})], done=True)
+    core = _core(tmp_path, [
+        listing,
+        ChatResponse(tool_calls=[ToolCall("list_dir", {"path": "."})], done=True),
+        ChatResponse(tool_calls=[ToolCall("list_dir", {"path": "."})], done=True),
+        ChatResponse(content_parts=[], done=True),
+        ChatResponse(content_parts=["The workspace holds one file, notes.md."], done=True),
+    ])
+    events = []
+    core.on_event(events.append)
+
+    core.run_turn("what is in here")
+
+    assert core.client.calls == 5
+    assert core.messages[-1]["content"] == "The workspace holds one file, notes.md."
+    assert core.messages[-1]["_phase"] == "final_answer"
+    # Tool-free, so the write-up cannot start new work.
+    assert core.client.seen_tools[-1] == []
+    assert core.client.seen_messages[-1][-1] == {
+        "role": "user", "content": FINAL_ANSWER_NUDGE,
+    }
+    # …and the instruction is request-only: replaying this conversation next
+    # turn must not show the user asking for a summary they never asked for.
+    assert not [m for m in core.messages if m.get("content") == FINAL_ANSWER_NUDGE]
+    done = next(e for e in events if e["type"] == "turn_done")
+    assert done["reason"] == "complete"
+    assert done["model_calls"] == 5
+
+
+def test_the_written_answer_pass_stays_out_of_turns_that_already_answered(tmp_path):
+    from ollama_code.ollama import ToolCall
+
+    (tmp_path / "notes.md").write_text("hi")
+
+    def listing():
+        return ChatResponse(tool_calls=[ToolCall("list_dir", {"path": "."})], done=True)
+
+    answered = _core(tmp_path, [
+        listing(), listing(), listing(),
+        ChatResponse(content_parts=[
+            "One file: `notes.md`, two bytes, unchanged since you asked."
+        ], done=True),
+    ])
+    answered.run_turn("what is in here")
+    assert answered.client.calls == 4
+
+    # One tool call and a short sentence is a legitimately terse turn.
+    terse = _core(tmp_path, [
+        listing(),
+        ChatResponse(content_parts=["Just notes.md."], done=True),
+    ])
+    terse.run_turn("what is in here")
+    assert terse.client.calls == 2
+
+    # No tools ran, so there is no work to write up.
+    chatted = _core(tmp_path, [ChatResponse(content_parts=["Hi."], done=True)])
+    chatted.run_turn("hi")
+    assert chatted.client.calls == 1
+
+    # A team worker's output is collected programmatically, not read.
+    worker = _core(tmp_path, [
+        listing(), listing(), listing(),
+        ChatResponse(content_parts=[], done=True),
+    ])
+    worker.agent_role_contract = "Read-only research worker."
+    worker.run_turn("what is in here")
+    assert worker.client.calls == 4
+
+
 def test_model_switch_refreshes_the_identity_mid_conversation(tmp_path):
     core = _core(tmp_path, [
         ChatResponse(content_parts=["hello"], done=True),
@@ -4630,6 +4961,7 @@ def test_solo_swarm_turn_combines_root_and_worker_usage_without_changing_context
             "type": "turn_done",
             "reason": "complete",
             "model_calls": 1,
+            "tool_steps": 6,
             "prompt_tokens": 200,
             "completion_tokens": 80,
             "provider": "ollama",
@@ -4648,6 +4980,8 @@ def test_solo_swarm_turn_combines_root_and_worker_usage_without_changing_context
         "completion_tokens": 110,
         "metered_tokens": 430,
         "model_calls": 4,
+        # The root's own steps; workers report model calls, not steps.
+        "tool_steps": 6,
         "root_prompt_tokens": 200,
         "root_completion_tokens": 80,
         "worker_prompt_tokens": 120,
@@ -6221,6 +6555,65 @@ def test_anthropic_output_cap_matches_the_room_reserved_for_it(tmp_path):
     assert "num_ctx" not in options, "meaningless in an OpenAI-style body"
 
 
+def test_anthropic_reasoning_effort_rides_inside_output_config(tmp_path):
+    """Anthropic carries effort in `output_config`, not at the top level, and
+    the token budget still has to travel with it."""
+    core = _remote_core(tmp_path, base_url="https://api.anthropic.com/v1")
+    core.config["published_context_window"] = 200_000
+    core.refresh_context_limit()
+    core.config["remote_reasoning_effort"] = "xhigh"
+
+    options = core.chat_options()
+
+    assert options == {
+        "max_tokens": core._reply_room(),
+        "output_config": {"effort": "xhigh"},
+    }
+    assert "reasoning_effort" not in options, "that is the OpenAI spelling"
+
+
+def test_openai_style_reasoning_effort_is_sent_top_level(tmp_path):
+    core = _remote_core(tmp_path)
+    core.config["remote_reasoning_effort"] = "low"
+
+    options = core.chat_options()
+
+    assert options == {"reasoning_effort": "low"}
+    assert "output_config" not in options, "that is the Anthropic spelling"
+
+
+def test_no_reasoning_effort_sends_no_effort_field(tmp_path):
+    """A model without an effort control rejects the field rather than ignoring
+    it, so an empty setting has to mean "send nothing" — not "send empty"."""
+    core = _remote_core(tmp_path)
+    core.config["remote_reasoning_effort"] = ""
+
+    assert core.chat_options() is None
+
+
+def test_switching_endpoints_drops_the_previous_effort(tmp_path):
+    """An effort belongs to the model that advertised it. Carrying "xhigh" to a
+    host that rejects the field would fail the turn outright."""
+    core = _remote_core(tmp_path)
+    core.config["remote_reasoning_effort"] = "high"
+
+    core.use_remote(base_url="https://api.anthropic.com/v1", api_key="k")
+
+    assert core.config["remote_reasoning_effort"] == ""
+
+
+def test_reselecting_the_same_endpoint_keeps_the_effort(tmp_path):
+    """"Missing means keep" — re-applying the same route must not silently
+    reset a choice the user made."""
+    core = _remote_core(tmp_path)
+    base = str(core.config["remote_base_url"])
+    core.config["remote_reasoning_effort"] = "high"
+
+    core.use_remote(base_url=base, api_key="k")
+
+    assert core.config["remote_reasoning_effort"] == "high"
+
+
 def test_a_pinned_window_that_spills_to_the_cpu_is_backed_off(tmp_path):
     """Asking for a large window costs KV cache, and past a point Ollama keeps
     the model loaded by leaving layers on the CPU — silently, and several times
@@ -6724,7 +7117,9 @@ def test_mid_turn_eviction_keeps_tool_pairing_and_the_newest_result(tmp_path, mo
             ToolCall("read_file", {"path": "b"}),
             ToolCall("read_file", {"path": "c"}),
         ], done=True),
-        ChatResponse(content_parts=["done"], done=True),
+        ChatResponse(content_parts=[
+            "Read all three files; the oldest results no longer fit the window."
+        ], done=True),
     ])
     core.client.loaded_window = 8_192
     # A model whose ceiling *is* 8k, so the pin cannot raise the window and the

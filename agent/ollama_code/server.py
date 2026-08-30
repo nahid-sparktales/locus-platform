@@ -518,7 +518,14 @@ def _run_user_turn(
                 virtual_tools=svc.core.solo_worker_virtual_tools,
             )
         except SoloSwarmError as exc:
-            svc.emit({"type": "note", "text": str(exc)})
+            # Durable, so the Runs panel can tell "the agent saw no reason to
+            # delegate" apart from "delegation was never available here". The
+            # two used to look identical once the note scrolled away.
+            svc.emit({
+                "type": "note",
+                "text": str(exc),
+                "solo_swarm_unavailable": True,
+            })
     svc.active_solo_swarm = swarm
     svc.core.tool_ctx.delegate_read_only = swarm.execute if swarm is not None else None
     svc.core.tool_registry.set_solo_swarm_enabled(swarm is not None)
@@ -1860,6 +1867,7 @@ def _task_diff(svc: ChatService, workspace_root: str, execution_path: str) -> st
     result = subprocess.run(
         ["git", "diff", "--binary", "--full-index", "HEAD", "--"],
         cwd=execution_path or workspace_root,
+        env=proxy.sanitized_child_environment(),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -2200,7 +2208,10 @@ async def _handle_client_message(svc: ChatService, msg: dict[str, Any]) -> None:
             _command_error(svc, str(mtype), "Message is too large to process safely.")
             return
         mode = str(msg.get("mode") or "").strip().lower()
-        if mode not in {"", "ask", "work", "plan", "build"}:
+        # "build" is the retired GSD raw value. It stays accepted so an older
+        # desktop build, a legacy schedule row, or a replayed transcript is not
+        # rejected mid-flight; `AgentCore.configure_agent` maps it to work.
+        if mode not in {"", "ask", "work", "plan", "grill", "build"}:
             _command_error(svc, str(mtype), "Unknown conversation mode.")
             return
         just_chat = mode == "ask"
@@ -2440,15 +2451,9 @@ async def _handle_client_message(svc: ChatService, msg: dict[str, Any]) -> None:
             return
         try:
             with svc.state_mutation():
-                names = [
-                    item.get("name")
-                    for item in core.client.list_models()
-                    if item.get("name")
-                ]
-                match = next((name for name in names if name == model), None) or next(
-                    (name for name in names if model in name),
-                    None,
-                )
+                # The provider owns what "installed" means; only Ollama has a
+                # local list to check against.
+                match = core.resolve_model_name(model)
                 if not match:
                     _command_error(svc, str(mtype), f"model '{model}' not installed")
                     return

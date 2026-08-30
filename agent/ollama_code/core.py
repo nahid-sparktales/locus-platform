@@ -40,7 +40,11 @@ from pathlib import Path
 from typing import Any
 
 from . import proxy
-from .agent_config import AgentConfiguration, compose_system_prompt
+from .agent_config import (
+    ANSWER_CONTRACT,
+    AgentConfiguration,
+    compose_system_prompt,
+)
 from .config import (
     DEFAULTS,
     MINIMUM_CONTEXT_WINDOW,
@@ -62,7 +66,7 @@ from .ollama import (
     looks_like_image_rejection,
     pinned_context_length,
 )
-from .permissions import PermissionManager, build_preview
+from .permissions import PermissionManager, build_preview, file_effects
 from .remote import (
     ANTHROPIC_MAX_OUTPUT_TOKENS,
     AUTH_ANTHROPIC,
@@ -90,6 +94,7 @@ _SOLO_ROOT_ONLY_TOOLS = {
     "delegate_read_only",
     "todo_write",
     "submit_plan",
+    "ask_user_question",
     "capture_context_snapshot",
     "propose_memory",
     "record_skill_observation",
@@ -231,7 +236,7 @@ Rules:
 3. Use todo_write to plan and track tasks that need multiple steps.
 4. Paths are relative to the working directory unless they start with /.
 5. Keep going: after a tool result comes back, continue with the next step until the task is fully done, then stop calling tools and give your final answer.
-6. Be concise. Final answers: 1-3 short sentences saying what you did and which files changed.
+6. Finish every turn with a written final answer that follows the locked answer contract below.
 7. When the user states an explicit durable preference, repeats a lasting constraint, or confirms a decision or outcome, call propose_memory once so it appears in the review-only Memory Inbox. Never propose guesses, secrets, or transient task details.
 
 Environment:
@@ -250,6 +255,20 @@ Answer the user's question conversationally using only the conversation shown to
 
 "Locus" names this app, not the model. Your underlying model: {model_identity}. When asked which model or LLM you are, answer with that.
 """
+
+#: What the runtime says when a turn did the work and then said nothing. The
+#: instruction is request-only — see AgentCore._run_final_answer_pass.
+FINAL_ANSWER_NUDGE = (
+    "This turn ended without a written answer. Using only what it has already "
+    "established, write the final answer now, following the locked answer "
+    "contract. Do not call any tools and do not start new work."
+)
+
+#: A reply shorter than this, after a turn that ran at least
+#: FINAL_ANSWER_TOOL_FLOOR tools, is a fragment rather than an answer. One tool
+#: call and a short sentence is a legitimately terse turn and is left alone.
+FINAL_ANSWER_MIN_CHARS = 40
+FINAL_ANSWER_TOOL_FLOOR = 3
 
 INIT_PROMPT = (
     "Analyze this project and create an OLLAMA.md file that will help future AI "
@@ -327,6 +346,10 @@ class AgentCore:
         self._chatgpt_thread_protocol = ""
         self._chatgpt_thread_history_revision = 0
         self._chatgpt_thread_needs_resume = False
+        # The helper's ``total`` token usage is cumulative for the whole
+        # thread; these baselines let a turn claim only its own delta.
+        self._chatgpt_thread_total_input = 0
+        self._chatgpt_thread_total_output = 0
         self.max_iterations = iteration_limit(
             max_iterations or self.config.get("max_iterations")
         )
@@ -532,7 +555,10 @@ class AgentCore:
             fallback_instructions=fallback_instructions,
         )
         self.agent_id = str(agent_id or "primary")[:128]
-        self.agent_mode = mode if mode in {"ask", "work", "plan", "build"} else "work"
+        # Keep "grill" listed: `sessions.py` drops the mode-instruction section
+        # for ask/work only, so an unlisted mode would coerce to "work" here and
+        # silently strip the $grilling activation on the parity path.
+        self.agent_mode = mode if mode in {"ask", "work", "plan", "grill", "build"} else "work"
         self.agent_role_contract = str(role_contract or "")[:8_000]
         self.memory_context = str(memory_context or "")[:24_000]
         self.continuity_context = (
@@ -938,18 +964,33 @@ class AgentCore:
         explicit user output limit uses `max_completion_tokens` for OpenAI-style
         endpoints. With no explicit limit, the existing provider defaults stay
         untouched. Ollama receives the equivalent `num_predict` only when set.
+
+        Reasoning effort rides along here too, in the shape each surface takes:
+        Anthropic carries it inside `output_config`, OpenAI-style endpoints take
+        a top-level `reasoning_effort`. An empty setting sends nothing, because
+        a model without an effort control rejects the field rather than
+        ignoring it. Ollama's graded thinking is not wired up: its `think` flag
+        is a bool, which is a different control, not a coarser one.
         """
         output_cap = self.agent_configuration.runtime_policy.max_output_tokens
         if self.provider == "remote":
+            anthropic = getattr(self.client, "auth_style", "") == AUTH_ANTHROPIC
             room = self._reply_room()
             if output_cap is not None:
                 room = min(room, output_cap) if room > 0 else output_cap
-            if getattr(self.client, "auth_style", "") == AUTH_ANTHROPIC and room > 0:
-                return {"max_tokens": room}
-            if output_cap is not None:
-                return {"max_completion_tokens": output_cap}
-            return None
-        options: dict[str, Any] = {}
+            options: dict[str, Any] = {}
+            if anthropic and room > 0:
+                options["max_tokens"] = room
+            elif output_cap is not None:
+                options["max_completion_tokens"] = output_cap
+            effort = str(self.config.get("remote_reasoning_effort") or "")
+            if effort:
+                if anthropic:
+                    options["output_config"] = {"effort": effort}
+                else:
+                    options["reasoning_effort"] = effort
+            return options or None
+        options = {}
         if self._context_requested > 0:
             options["num_ctx"] = self._context_requested
         if output_cap is not None:
@@ -1029,6 +1070,7 @@ class AgentCore:
         lists_models: bool | None = None,
         context_window_tokens: Any = None,
         published_context_window: Any = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         """Point the agent at an OpenAI-compatible endpoint.
 
@@ -1041,6 +1083,10 @@ class AgentCore:
         They arrive separately because they are not equally trustworthy: the
         first clamps and is reported as configured, the second is a labelled
         fallback used only when the endpoint says nothing about itself.
+
+        ``reasoning_effort`` follows the ``None`` rule too. "" is a meaningful
+        value, not an absent one: it means send no effort field at all, which
+        is what a model without an effort control requires.
         """
         normalized_url = normalize_base_url(base_url)
         effective_key = (
@@ -1079,6 +1125,13 @@ class AgentCore:
             self.config["remote_account_label"] = account_label.strip()
         if lists_models is not None:
             self.config["remote_lists_models"] = bool(lists_models)
+        if reasoning_effort is not None:
+            self.config["remote_reasoning_effort"] = reasoning_effort.strip()
+        elif _different_host(previous_url, self.config["remote_base_url"]):
+            # An effort belongs to the model that advertised it. Carrying one
+            # across endpoints is how "xhigh" reaches a model that rejects the
+            # field and fails the turn outright.
+            self.config["remote_reasoning_effort"] = ""
         self._build_remote_client()
         # _build_remote_client only adopts a non-empty model, so clearing the
         # config above is not enough on its own: self.model would keep the
@@ -1185,6 +1238,9 @@ class AgentCore:
             "remote_model": str(self.config.get("remote_model") or ""),
             "has_api_key": bool(self.config.get("remote_api_key")),
             "account_label": self.account_label,
+            "remote_reasoning_effort": str(
+                self.config.get("remote_reasoning_effort") or ""
+            ),
             "chatgpt_native_mode": bool(self.config.get("chatgpt_native_mode", True)),
             "chatgpt_web_search": bool(self.config.get("chatgpt_web_search", False)),
             "chatgpt_reasoning_effort": str(
@@ -1208,6 +1264,39 @@ class AgentCore:
         if self.provider != "remote":
             return ""
         return str(self.config.get("remote_account_label") or "")
+
+    def resolve_model_name(self, name: str) -> str | None:
+        """The installed model `name` refers to, or None when it is unknown.
+
+        Only Ollama has an "installed list" to check against, and only there is
+        a substring match wanted — its tags carry suffixes (`qwen3:8b` for
+        `qwen3`). A hosted provider's catalogue lives behind the account, not
+        behind `self.client`: `client` stays an `OllamaClient` for the whole
+        ChatGPT-plan branch, so validating there rejected every ChatGPT model as
+        "not installed". The same applies to an endpoint that does not serve
+        `/models` — `RemoteClient` answers with the one model already
+        configured, which refused every switch away from it.
+
+        `ensure_model` and `refresh_context_limit` already skip themselves for
+        those providers; this keeps the model-switch command consistent.
+        """
+        wanted = name.strip()
+        if not wanted:
+            return None
+        if self.provider == "chatgpt":
+            return wanted
+        if self.provider == "remote" and not getattr(self.client, "lists_models", True):
+            return wanted
+        names = [
+            str(item.get("name"))
+            for item in self.client.list_models()
+            if item.get("name")
+        ]
+        if wanted in names:
+            return wanted
+        if self.provider == "remote":
+            return None
+        return next((candidate for candidate in names if wanted in candidate), None)
 
     def set_model(self, name: str) -> None:
         self.model = name
@@ -1246,6 +1335,7 @@ class AgentCore:
         self._clear_chatgpt_thread()
         self.tool_ctx.todos = []
         self.tool_ctx.plan_document = None
+        self.tool_ctx.user_question = None
         self._emit({"type": "todo_update", "todos": []})
         self.mcp.refresh(wait=False)
         self._emit_info()
@@ -1293,6 +1383,7 @@ class AgentCore:
         self._clear_chatgpt_thread()
         self.tool_ctx.todos = []
         self.tool_ctx.plan_document = None
+        self.tool_ctx.user_question = None
         self.tool_ctx.read_files.clear()
         self._last_user_message = None
         self._pending_computer_screenshot = None
@@ -1307,6 +1398,8 @@ class AgentCore:
         self._chatgpt_thread_protocol = ""
         self._chatgpt_thread_history_revision = 0
         self._chatgpt_thread_needs_resume = False
+        self._chatgpt_thread_total_input = 0
+        self._chatgpt_thread_total_output = 0
 
     def chatgpt_parity_active(self, allow_tools: bool = True) -> bool:
         """True when this turn runs under the Codex-native parity contract.
@@ -1349,8 +1442,18 @@ class AgentCore:
             sections.append(
                 "You are in Locus Plan mode: investigate, then call the "
                 "submit_plan tool exactly once with your final implementation "
-                "plan. Do not modify any files in this mode."
+                "plan. Ask clarifying questions through the ask_user_question "
+                "tool. Do not modify any files in this mode."
             )
+        if self.agent_mode == "grill":
+            sections.append(
+                "You are in Locus Grill mode: after writing your question in "
+                "the transcript, deliver it by calling the ask_user_question "
+                "tool with the same title, question, options, and your "
+                "recommended answer, then end your turn. Do not modify any "
+                "files in this mode."
+            )
+        sections.append("## Locus answer contract\n" + ANSWER_CONTRACT)
         return "\n\n".join(sections)
 
     def start_new_session(
@@ -1483,6 +1586,7 @@ class AgentCore:
             result = subprocess.run(
                 ["git", "rev-parse", "--show-toplevel"],
                 cwd=self.workspace_root,
+                env=proxy.sanitized_child_environment(),
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -1542,6 +1646,9 @@ class AgentCore:
         persisted_user_metadata: dict[str, Any] | None = None,
     ) -> None:
         """Run one local-agent turn."""
+        # A question belongs to the turn that asks it. A stale one would
+        # wrongly suppress the next turn's final-answer pass.
+        self.tool_ctx.user_question = None
         if self.provider == "chatgpt":
             self._run_chatgpt_turn(
                 user_text,
@@ -1584,6 +1691,15 @@ class AgentCore:
         prompt_before = self.total_prompt_tokens
         completion_before = self.total_completion_tokens
         reason = "complete"
+        # App Server bills one thread call per turn, so the classic loop
+        # counter never advances here and a twenty-step build reported a
+        # single model call. Count what actually happened instead: one model
+        # call per token-usage update, and every tool step Locus ran. Declared
+        # out here because a missing helper skips the block below entirely.
+        native_model_calls = 0
+        native_tool_steps = 0
+        native_prompt_tokens = 0
+        native_completion_tokens = 0
         self._turn_allows_tools = allow_tools
         self._last_turn_allowed_tools = allow_tools
         self._interrupt.clear()
@@ -1748,6 +1864,10 @@ class AgentCore:
                     self._chatgpt_thread_protocol = manager.runtime_version
                     self._chatgpt_thread_history_revision = len(self.messages)
                     self._chatgpt_thread_needs_resume = False
+                    # A replacement thread's totals restart from zero; a stale
+                    # baseline from the retired thread would under-bill it.
+                    self._chatgpt_thread_total_input = 0
+                    self._chatgpt_thread_total_output = 0
                     self.session.append({
                         "type": "chatgpt_thread",
                         "thread_id": self._chatgpt_thread_id,
@@ -1759,7 +1879,6 @@ class AgentCore:
                 assistant_items: dict[str, dict[str, Any]] = {}
                 synthetic_message_id = "managed-message"
                 synthetic_reasoning_id = "managed-reasoning"
-                dynamic_call_count = 0
                 dynamic_call_limit = min(
                     self.max_iterations,
                     max(int(model_call_limit), 1)
@@ -1899,7 +2018,8 @@ class AgentCore:
                         })
 
                 def handle_event(event: dict[str, Any]) -> None:
-                    nonlocal usage
+                    nonlocal usage, native_model_calls
+                    nonlocal native_prompt_tokens, native_completion_tokens
                     method = str(event.get("method") or "")
                     params = event.get("params")
                     if not isinstance(params, dict):
@@ -1991,17 +2111,29 @@ class AgentCore:
                         candidate = params.get("tokenUsage")
                         if isinstance(candidate, dict):
                             usage = candidate
+                            # ``last`` is one model call's spend. The helper
+                            # sends one update per call, so summing them is the
+                            # turn's true cost; keeping only the final snapshot
+                            # reported the last call as the whole turn.
+                            last = candidate.get("last")
+                            if isinstance(last, dict):
+                                prompt = max(int(last.get("inputTokens") or 0), 0)
+                                completion = max(int(last.get("outputTokens") or 0), 0)
+                                if prompt or completion:
+                                    native_model_calls += 1
+                                    native_prompt_tokens += prompt
+                                    native_completion_tokens += completion
                     elif method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
                         raise RuntimeError("ChatGPT helper requested a disabled native approval")
 
                 def handle_tool(name: str, arguments: dict[str, Any], call_id: str) -> str:
-                    nonlocal dynamic_call_count
+                    nonlocal native_tool_steps
                     if not allow_tools:
                         return "Not run: Just Chat has no tool or workspace access."
-                    if dynamic_call_count >= dynamic_call_limit:
+                    if native_tool_steps >= dynamic_call_limit:
                         self._interrupt.set()
                         return "Error: Locus stopped this turn at its configured tool-step budget."
-                    dynamic_call_count += 1
+                    native_tool_steps += 1
                     if parity:
                         # Parity names exist only on the wire. Everything
                         # downstream — deny lists, accept-edits, previews,
@@ -2042,16 +2174,20 @@ class AgentCore:
                     event_handler=handle_event,
                     should_interrupt=self._interrupt.is_set,
                 )
-                # A disconnect can omit the terminal notification after valid
-                # deltas. Finalize those partial items in first-seen order so
-                # the transcript never keeps a dangling streaming row.
-                for state in assistant_items.values():
-                    if state["ended"]:
-                        continue
-                    if state["kind"] == "message":
-                        finish_message(state)
-                    else:
-                        finish_reasoning(state)
+                def finalize_items() -> None:
+                    # A disconnect can omit the terminal notification after
+                    # valid deltas. Finalize those partial items in first-seen
+                    # order so the transcript never keeps a dangling streaming
+                    # row.
+                    for state in list(assistant_items.values()):
+                        if state["ended"]:
+                            continue
+                        if state["kind"] == "message":
+                            finish_message(state)
+                        else:
+                            finish_reasoning(state)
+
+                finalize_items()
                 if not any(
                     state["kind"] == "message" for state in assistant_items.values()
                 ):
@@ -2063,11 +2199,71 @@ class AgentCore:
                         "content": "",
                         "_phase": "final_answer",
                     })
-                last = usage.get("last") if isinstance(usage.get("last"), dict) else {}
-                prompt = int(last.get("inputTokens") or 0)
-                completion = int(last.get("outputTokens") or 0)
-                self.total_prompt_tokens += max(prompt, 0)
-                self.total_completion_tokens += max(completion, 0)
+                if self._needs_final_answer_pass(
+                    reason=reason, tool_calls=native_tool_steps
+                ):
+                    # The helper thread already holds this whole turn, so the
+                    # write-up is one more turn on it with no tools attached —
+                    # not a rebuilt request. Its own failure must not lose the
+                    # work that already succeeded, so it is caught here rather
+                    # than by the turn's handler, which would clear the thread.
+                    try:
+                        manager.run_turn(
+                            thread_id=self._chatgpt_thread_id,
+                            text=FINAL_ANSWER_NUDGE,
+                            model=self.model,
+                            effort=effort,
+                            tool_handler=None,
+                            event_handler=handle_event,
+                            should_interrupt=self._interrupt.is_set,
+                        )
+                        finalize_items()
+                    except (CodexAppServerError, RuntimeError, ValueError):
+                        self._emit({
+                            "type": "note",
+                            "text": "Locus could not write a closing summary for this turn.",
+                        })
+                # The per-call sum built above is turn-scoped by construction.
+                # The helper's ``total`` is cumulative for the whole thread, so
+                # it may only stand in as a delta against the previous turn's
+                # baseline — attributing it wholesale re-billed the entire
+                # thread to every turn.
+                total = usage.get("total") if isinstance(usage.get("total"), dict) else {}
+                total_input = max(int(total.get("inputTokens") or 0), 0)
+                total_output = max(int(total.get("outputTokens") or 0), 0)
+                delta_input = 0
+                delta_output = 0
+                if total_input or total_output:
+                    # A turn that reported no totals at all must leave the
+                    # baselines alone: zeros are absence, not a reset.
+                    if (
+                        total_input < self._chatgpt_thread_total_input
+                        or total_output < self._chatgpt_thread_total_output
+                    ):
+                        # The helper restarted or compacted the thread.
+                        self._chatgpt_thread_total_input = 0
+                        self._chatgpt_thread_total_output = 0
+                    delta_input = max(total_input - self._chatgpt_thread_total_input, 0)
+                    delta_output = max(total_output - self._chatgpt_thread_total_output, 0)
+                    self._chatgpt_thread_total_input = total_input
+                    self._chatgpt_thread_total_output = total_output
+                    if self._chatgpt_thread_id:
+                        # Re-stamp the resume marker so a resumed session
+                        # inherits the baselines along with the thread, rather
+                        # than re-billing the whole thread to its first turn.
+                        self.session.append({
+                            "type": "chatgpt_thread",
+                            "thread_id": self._chatgpt_thread_id,
+                            "protocol_version": self._chatgpt_thread_protocol,
+                            "history_revision": self._chatgpt_thread_history_revision,
+                            "tool_schema_fingerprint": self._chatgpt_thread_fingerprint,
+                            "total_input_tokens": self._chatgpt_thread_total_input,
+                            "total_output_tokens": self._chatgpt_thread_total_output,
+                        })
+                prompt = native_prompt_tokens or delta_input
+                completion = native_completion_tokens or delta_output
+                self.total_prompt_tokens += prompt
+                self.total_completion_tokens += completion
                 if self._interrupt.is_set():
                     reason = "interrupted"
             except (CodexAppServerError, RuntimeError, ValueError) as error:
@@ -2083,7 +2279,8 @@ class AgentCore:
             "type": "turn_done",
             "reason": reason,
             "duration_ms": max(int((time.monotonic() - started_at) * 1000), 0),
-            "model_calls": 1,
+            "model_calls": max(native_model_calls, 1),
+            "tool_steps": native_tool_steps,
             "iteration_limit": self.max_iterations,
             "model_call_limit": model_call_limit,
             "prompt_tokens": max(self.total_prompt_tokens - prompt_before, 0),
@@ -2434,6 +2631,75 @@ class AgentCore:
     #: Shorter alias used by the WebSocket handler.
     retry_last = retry_last_response
 
+    def _last_final_answer_text(self) -> str:
+        """This turn's visible answer, or "" when it never wrote one.
+
+        Walks back only as far as the current turn: a user message ends the
+        search, and so does a tool result, which in the classic loop is what
+        sits after an assistant message that only asked for tools.
+        """
+        for message in reversed(self.messages):
+            role = str(message.get("role") or "")
+            if role in {"user", "tool"}:
+                break
+            if role != "assistant":
+                continue
+            if message.get("_display_only"):
+                continue
+            if str(message.get("_phase") or "final_answer") != "final_answer":
+                # Codex commentary is narration between tool calls, not the
+                # answer; keep looking back through this turn.
+                continue
+            if message.get("tool_calls"):
+                break
+            return str(message.get("content") or "").strip()
+        return ""
+
+    def _needs_final_answer_pass(self, *, reason: str, tool_calls: int) -> bool:
+        """Whether this turn worked and then failed to say anything about it."""
+        if reason != "complete" or tool_calls <= 0:
+            return False
+        if self._interrupt.is_set() or not self._turn_allows_tools:
+            return False
+        if self.agent_role_contract or self._suppress_turn_done:
+            # Team workers and background runs are collected programmatically.
+            # Nobody is reading a write-up, and an extra call would be spent on
+            # text that is thrown away.
+            return False
+        if self.tool_ctx.user_question is not None:
+            # The question is this turn's deliverable, and the tool result just
+            # told the model to end its turn and wait. A nudge here would talk
+            # over the pending popup.
+            return False
+        text = self._last_final_answer_text()
+        if not text:
+            return True
+        return (
+            tool_calls >= FINAL_ANSWER_TOOL_FLOOR
+            and len(text) < FINAL_ANSWER_MIN_CHARS
+        )
+
+    def _run_final_answer_pass(self) -> bool:
+        """One tool-free call that writes the answer the turn owed the user."""
+        resp = self._stream_response(
+            extra_messages=[{"role": "user", "content": FINAL_ANSWER_NUDGE}],
+            disable_tools=True,
+        )
+        if resp is None:
+            # An error or a partial reply already reached the conversation.
+            return False
+        text = strip_think(resp.content).strip()
+        if not text:
+            return False
+        self._add_message({
+            "role": "assistant",
+            "content": text,
+            "_phase": "final_answer",
+        })
+        self.total_prompt_tokens += resp.prompt_eval_count
+        self.total_completion_tokens += resp.eval_count
+        return True
+
     def _run_response_loop(
         self,
         decider: PermissionDecider | None = None,
@@ -2446,6 +2712,7 @@ class AgentCore:
         completion_tokens_before = self.total_completion_tokens
         reason = "complete"
         iteration = 0
+        tool_calls_run = 0
         iteration_limit = self.max_iterations
         hard_call_limit = max(int(model_call_limit), 0) if model_call_limit is not None else None
         while iteration < iteration_limit and (hard_call_limit is None or iteration < hard_call_limit):
@@ -2572,6 +2839,7 @@ class AgentCore:
                     steered = True
                     break
                 self._in_tool_call = True
+                tool_calls_run += 1
                 try:
                     result = self._run_tool_call(tc, decider)
                 finally:
@@ -2622,11 +2890,16 @@ class AgentCore:
         # accepted before this point is either applied above or caused another
         # loop iteration; anything later belongs in Queue or Stop & Send.
         self.end_steerable_turn()
+        if self._needs_final_answer_pass(reason=reason, tool_calls=tool_calls_run):
+            if self._run_final_answer_pass():
+                iteration += 1
         terminal = {
             "type": "turn_done",
             "reason": reason,
             "duration_ms": max(int((time.monotonic() - started_at) * 1000), 0),
             "model_calls": iteration,
+            # The step count both routes agree on: one per tool Locus ran.
+            "tool_steps": tool_calls_run,
             "iteration_limit": iteration_limit,
             "model_call_limit": hard_call_limit,
             # This turn's token spend and provenance, additive so old clients
@@ -2707,7 +2980,18 @@ class AgentCore:
         self,
         allow_overflow_retry: bool = True,
         allow_image_retry: bool = True,
+        *,
+        extra_messages: list[dict[str, Any]] | None = None,
+        disable_tools: bool = False,
     ) -> ChatResponse | None:
+        """Stream one model call.
+
+        ``extra_messages`` are appended to the request only: they never enter
+        ``self.messages``, so a one-off instruction cannot leak into the
+        conversation the next turn replays. ``disable_tools`` withholds the
+        schemas without touching ``_turn_allows_tools``, which would swap the
+        Just Chat system prompt in underneath.
+        """
         self._emit({"type": "message_start"})
         think_filter = ThinkFilter()
         inline_thinking: list[str] = []
@@ -2752,8 +3036,12 @@ class AgentCore:
             try:
                 resp = self.client.chat_stream(
                     model=self.model,
-                    messages=self._request_messages(),
-                    tools=self.tool_registry.schemas() if self._turn_allows_tools else [],
+                    messages=self._request_messages() + list(extra_messages or []),
+                    tools=(
+                        []
+                        if disable_tools or not self._turn_allows_tools
+                        else self.tool_registry.schemas()
+                    ),
                     on_token=on_token,
                     should_stop=self._should_stop_stream,
                     on_thinking=on_thinking,
@@ -2807,6 +3095,8 @@ class AgentCore:
                 return self._stream_response(
                     allow_overflow_retry=allow_overflow_retry,
                     allow_image_retry=False,
+                    extra_messages=extra_messages,
+                    disable_tools=disable_tools,
                 )
             if (
                 allow_overflow_retry
@@ -2832,6 +3122,8 @@ class AgentCore:
                 return self._stream_response(
                     allow_overflow_retry=False,
                     allow_image_retry=allow_image_retry,
+                    extra_messages=extra_messages,
+                    disable_tools=disable_tools,
                 )
             if partial:
                 visible_text.append(partial)
@@ -2977,6 +3269,9 @@ class AgentCore:
     ) -> str:
         call_id = uuid.uuid4().hex[:10]
         summary, detail = build_preview(tc.name, tc.arguments, self.tool_ctx)
+        # Computed before the call runs: telling a create from an overwrite
+        # depends on whether the target exists yet.
+        effects = file_effects(tc.name, tc.arguments, self.tool_ctx)
         worker_label = str((event_context or {}).get("agent_name") or "").strip()
         if worker_label:
             summary = f"{worker_label}: {summary}"
@@ -3147,12 +3442,15 @@ class AgentCore:
             "result": result,
             "ok": ok,
             "denied": False,
+            **({"file_effects": effects} if effects and ok else {}),
             **event_info,
         })
         if tc.name in {"todo_write", "submit_plan"}:
             self._emit({"type": "todo_update", "todos": self.tool_ctx.todos})
         if tc.name == "submit_plan" and self.tool_ctx.plan_document is not None and ok:
             self._emit({"type": "plan_ready", "plan": dict(self.tool_ctx.plan_document)})
+        if tc.name == "ask_user_question" and self.tool_ctx.user_question is not None and ok:
+            self._emit({"type": "question_ready", "question": dict(self.tool_ctx.user_question)})
         return result
 
     def _targets_workspace(self, tc: ToolCall) -> bool:
@@ -3466,6 +3764,14 @@ class AgentCore:
                 self._chatgpt_thread_protocol = str(marker["protocol_version"])
                 self._chatgpt_thread_history_revision = int(marker["history_revision"])
                 self._chatgpt_thread_needs_resume = True
+                # The resumed thread keeps its cumulative totals; without the
+                # stored baselines its first turn would re-bill all of them.
+                self._chatgpt_thread_total_input = max(
+                    int(marker.get("total_input_tokens") or 0), 0
+                )
+                self._chatgpt_thread_total_output = max(
+                    int(marker.get("total_output_tokens") or 0), 0
+                )
         self._pending_computer_screenshot = None
         self._ax_only_routes.clear()
         # Continue appending to the session the user resumed.
