@@ -67,6 +67,18 @@ def test_bundled_codex_component_is_fully_pinned_for_apple_silicon():
     assert re.fullmatch(r"[0-9a-f]{64}", target["executable_sha256"])
     assert target["archive_size"] > 0
     assert target["executable_size"] > 0
+    assert target["companion_executables"] == [
+        {
+            "name": "codex-code-mode-host",
+            "executable_path": (
+                "package/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+            ),
+            "executable_sha256": (
+                "a059beb029cdbc989e72e23f8680be9f703cb6cf83d9598d91041f82178d018d"
+            ),
+            "executable_size": 49_991_616,
+        }
+    ]
     assert target["upstream_signing_team_id"] == "2DC432GLL2"
 
 
@@ -766,6 +778,32 @@ def test_parity_shell_and_update_plan_execute_as_canonical_tools(tmp_path):
     ]
 
 
+def test_parity_browser_navigation_reaches_the_native_broker(tmp_path):
+    runtime = ParityFakeRuntime(tool_calls=[
+        ("browser_navigate", {"url": "https://www.reddit.com/"}),
+    ])
+    core = _managed_core(tmp_path, runtime)
+    core.tool_registry.browser_enabled = True
+    calls = []
+    core.browser_executor = lambda name, args, request_id: calls.append(
+        (name, args, request_id)
+    ) or "Opened Reddit"
+    events = []
+    core.on_event(events.append)
+
+    core.run_turn(DECORATED, lambda *_args: "once")
+
+    advertised = {
+        item["function"]["name"] for item in runtime.start_kwargs[-1]["tools"]
+    }
+    assert {"browser_tabs", "browser_read_page", "browser_navigate"} <= advertised
+    assert calls and calls[0][0:2] == (
+        "browser_navigate", {"url": "https://www.reddit.com/"},
+    )
+    proposed = [event for event in events if event["type"] == "tool_call_proposed"]
+    assert proposed[-1]["tool"] == "browser_navigate"
+
+
 def test_parity_schemas_add_submit_plan_only_in_plan_mode(tmp_path):
     runtime = ParityFakeRuntime()
     core = _managed_core(tmp_path, runtime)
@@ -798,6 +836,25 @@ def test_parity_schemas_add_submit_plan_only_in_plan_mode(tmp_path):
     assert "delegate_read_only" in {
         item["function"]["name"] for item in start["tools"]
     }
+
+
+def test_parity_browser_schemas_follow_broker_and_access_policy(tmp_path):
+    core = _managed_core(tmp_path, ParityFakeRuntime())
+
+    def names():
+        return {
+            item["function"]["name"] for item in core.tool_registry.parity_schemas()
+        }
+
+    assert "browser_read_page" not in names()
+    core.tool_registry.browser_enabled = True
+    assert {"browser_read_page", "browser_tabs", "browser_navigate"} <= names()
+
+    core.tool_registry.set_mcp_agent_policy(
+        {}, access_ceiling="read_only", role="reviewer",
+    )
+    assert "browser_read_page" in names()
+    assert "browser_navigate" not in names()
 
 
 class MeteredManagedRuntime(FakeManagedRuntime):
