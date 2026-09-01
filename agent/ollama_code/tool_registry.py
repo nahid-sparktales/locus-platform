@@ -1059,8 +1059,9 @@ class ToolRegistry:
         """The Codex-parity tool surface for a native-mode ChatGPT turn.
 
         Deliberately minimal: the Codex-native aliases plus Locus's bounded
-        adaptive delegation tool when available. The user's capability policy
-        is applied against each canonical tool, the same gate `schemas()` uses.
+        adaptive delegation and native browser tools when available. The user's
+        capability policy is applied against each canonical tool, the same gate
+        `schemas()` uses.
         `submit_plan` joins only in Plan mode, where Locus's plan-approval flow
         depends on it; `ask_user_question` joins every parity turn, so the
         question popup works in Work and Grill as well.
@@ -1084,6 +1085,11 @@ class ToolRegistry:
             schema for schema in self.simulator_schemas()
             if self._user_allows(schema["function"]["name"])
         )
+        # Browser control is a Locus-native capability, not a Codex alias. It
+        # must still ride the native-prompt route or ChatGPT sees a shared tab
+        # but has no way to read or navigate it. browser_schemas() applies the
+        # broker-enabled, access-ceiling, history/autofill, and user-policy gates.
+        schemas.extend(self.browser_schemas())
         return schemas
 
     def simulator_schemas(self) -> list[dict[str, Any]]:
