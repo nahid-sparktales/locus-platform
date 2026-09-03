@@ -39,7 +39,7 @@ refused unless the capability is configured.
   "capabilities": {
     "durable_runs": true, "recovery_controls": true, "evaluations": true,
     "adaptive_routing": true, "workspace_knowledge": true, "modern_mcp": true,
-    "browser": true, "transcript_search": true
+    "browser": true, "transcript_search": true, "event_triggers": true
   }
 }
 ```
@@ -78,6 +78,34 @@ time are persisted with the run.
 `dispatcher_plan_rejected` is an additive diagnostic event with `stage`
 (`initial` or `repair`), a bounded validation `reason`, `response_source`, and
 `will_retry`. It never contains the raw model response or provider credentials.
+
+### Scheduled and event-triggered agents
+
+Every schedule and event trigger owns one durable primary chat. Repeated runs
+continue that history instead of creating loose conversations, and worktree
+agents reuse one managed checkout that is refreshed from the current workspace
+before each run. Queue admission and the busy-chat check are atomic. A due
+occurrence that overlaps active work is recorded as skipped without replacing
+the agent's last successful run or consuming a one-shot schedule's cadence.
+
+`/api/connectors` stores bounded public connection metadata for Gmail,
+Telegram, signed webhooks, and price feeds. Credentials stay in the native
+connector owner. `/api/event-triggers` binds a validated instruction, source-
+specific filters, mode, allowed action connections, and one target chat.
+Inbound events are capped at 256 KiB, stripped of credential-shaped fields,
+deduplicated by source event ID, and treated as untrusted data beneath the
+trusted automation instruction. Telegram triggers require an explicit filter;
+webhooks require an event-name allowlist; and price conditions accept only
+bounded crossing rules over current, finite quotes.
+
+Matched events become durable deliveries with pending, claiming, queued, or
+failed state. Dispatch is FIFO per target chat and can be retried explicitly;
+startup exposes pending deliveries but does not silently execute them. Native
+connector actions are announced through a versioned, connection-scoped
+capability, still obey the normal read/write permission ceiling, and record an
+idempotency receipt before a delivery can repeat the same external mutation.
+The `/api/event-deliveries` routes expose bounded status and lifecycle actions,
+while `/api/connector-actions/receipts` provides receipt lookup and creation.
 
 `GET /api/runs/{run_id}/export?include_content=false` produces the
 redacted `locusrun` version-1 document. Conversation, goal, output, reasoning,

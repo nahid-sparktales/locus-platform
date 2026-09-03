@@ -35,6 +35,7 @@
     "agents.adaptive-work",
     "agents.explicit-teams",
     "agents.solo-delegation",
+    "agents.schedules-event-triggers-dedicated-chats",
     "runs.durable-history-recovery-evidence",
     "runs.schedules-evaluations-usage",
     "browser.shared-human-agent-tabs",
