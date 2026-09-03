@@ -11,6 +11,7 @@ This repository owns the parts of the product that must stay wire-compatible:
   content extraction contracts;
 - typed, citation-validated, read-only Research Board messages and runtime;
 - category-gated encrypted Autofill and least-authority wallet broker contracts;
+- durable scheduled and event-triggered agents with native connector brokering;
 - protocol fixtures and the direct-download parity manifest.
 
 The native Swift Locus app and the Electron Locus Browser keep separate UI and

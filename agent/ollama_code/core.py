@@ -30,6 +30,7 @@ import json
 import os
 import platform
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -333,7 +334,39 @@ class AgentCore:
         self.client: Any = OllamaClient(self.host)
         self.model: str = model or str(self.config.get("model") or "")
         if self.provider == "remote":
-            self._build_remote_client()
+            try:
+                self._build_remote_client()
+            except ValueError as error:
+                # A keyless plain-HTTP LAN endpoint is a legitimate saved
+                # state, and load_config may have injected an API key from the
+                # environment (OPENAI_API_KEY, HF_TOKEN, …) that this endpoint
+                # cannot lawfully use. Booting without the env key honours
+                # both rules; dying here would leave no UI path back. The key
+                # only ever lives in config at boot via that injection — disk
+                # never stores it — so dropping it loses nothing the app will
+                # not re-send.
+                #
+                # Only the key may be dropped, and only when the key is what
+                # the endpoint refuses: re-validating without it separates
+                # "this URL needs no key" from "this URL is unusable", so a
+                # malformed endpoint still raises its own error rather than
+                # an irrelevant note about a credential.
+                if not str(self.config.get("remote_api_key") or ""):
+                    raise
+                try:
+                    validate_remote_url(
+                        normalize_base_url(
+                            str(self.config.get("remote_base_url") or "")
+                        )
+                    )
+                except ValueError:
+                    raise error from None
+                print(
+                    f"warning: ignoring environment API key: {error}",
+                    file=sys.stderr,
+                )
+                self.config["remote_api_key"] = ""
+                self._build_remote_client()
         elif self.provider == "chatgpt":
             self.host = "chatgpt://managed"
             self.model = model or str(self.config.get("chatgpt_model") or "")
@@ -417,6 +450,12 @@ class AgentCore:
         #: mid-turn budget guard extends this with whatever was appended since.
         self._last_call_tokens = 0
         self._messages_at_last_call = 0
+        #: The input tokens the provider charged for the most recent model
+        #: call. Kept apart from `_last_call_tokens`, which is reset every
+        #: turn and deliberately inflated by the overflow recovery path: this
+        #: one is only ever a measurement, and it outlives the turn so the
+        #: context meter still reads true once a turn has finished.
+        self._measured_prompt_tokens = 0
         # Just Chat is enforced at the model boundary, not merely suggested in
         # its prompt. These are separate so Retry preserves the safety mode of
         # the answer being regenerated.
@@ -427,6 +466,7 @@ class AgentCore:
         self.browser_executor: Callable[[str, dict[str, Any], str], str] | None = None
         self.notes_executor: Callable[[str, dict[str, Any], str], str] | None = None
         self.wallet_executor: Callable[[str, dict[str, Any], str], str] | None = None
+        self.connector_executor: Callable[[str, dict[str, Any], str], str] | None = None
         self._pending_computer_screenshot: dict[str, str] | None = None
         self._ax_only_routes: set[str] = set()
         self._suppress_turn_done = False
@@ -1047,6 +1087,7 @@ class AgentCore:
         # The label describes a remote account; it would be a lie about the
         # local runtime, and the transcript reads it.
         self.config["remote_account_label"] = ""
+        self.config["remote_account_id"] = ""
         self.model = str(self.config.get("model") or "")
         # Left unknown rather than resolved here: resolving costs Ollama I/O and
         # the app awaits this endpoint on a short timeout. `resolve_context_limit_soon`
@@ -1067,6 +1108,7 @@ class AgentCore:
         model: str = "",
         auth_style: str | None = None,
         account_label: str | None = None,
+        account_id: str | None = None,
         lists_models: bool | None = None,
         context_window_tokens: Any = None,
         published_context_window: Any = None,
@@ -1123,6 +1165,8 @@ class AgentCore:
             )
         if account_label is not None:
             self.config["remote_account_label"] = account_label.strip()
+        if account_id is not None:
+            self.config["remote_account_id"] = account_id.strip()
         if lists_models is not None:
             self.config["remote_lists_models"] = bool(lists_models)
         if reasoning_effort is not None:
@@ -1254,6 +1298,7 @@ class AgentCore:
             self.model,
             provider=self.provider,
             account=self.account_label,
+            account_id=self.account_id,
         )
 
     @property
@@ -1264,6 +1309,15 @@ class AgentCore:
         if self.provider != "remote":
             return ""
         return str(self.config.get("remote_account_label") or "")
+
+    @property
+    def account_id(self) -> str:
+        """The stable native account identifier for persisted background work."""
+        if self.provider == "chatgpt":
+            return str(self.config.get("chatgpt_account_id") or "")
+        if self.provider != "remote":
+            return ""
+        return str(self.config.get("remote_account_id") or "")
 
     def resolve_model_name(self, name: str) -> str | None:
         """The installed model `name` refers to, or None when it is unknown.
@@ -1380,6 +1434,7 @@ class AgentCore:
 
     def reset_conversation(self) -> None:
         self.messages = [self.system_message()]
+        self._measured_prompt_tokens = 0
         self._clear_chatgpt_thread()
         self.tool_ctx.todos = []
         self.tool_ctx.plan_document = None
@@ -1540,8 +1595,43 @@ class AgentCore:
         # count, not a character count.
         return total // 4 + image_tokens
 
+    def measured_context_tokens(self) -> int:
+        """The conversation's share of the last measured request, or 0.
+
+        Scaled to match `approx_tokens`: the provider counts the whole request
+        while the estimate and `budget_tokens` both work on what the
+        conversation itself occupies, so the parts that ride along on every
+        request come back off.
+        """
+        if self._measured_prompt_tokens <= 0:
+            return 0
+        return max(
+            self._measured_prompt_tokens
+            - self._tool_schema_tokens()
+            - self._extension_prompt_tokens(),
+            0,
+        )
+
+    def context_tokens(self) -> int:
+        """What the conversation actually occupies, best available answer.
+
+        `approx_tokens` can only see `self.messages`. A managed ChatGPT turn
+        keeps its working context in the helper thread, so the estimate reads
+        near-empty for a turn that really sent tens of thousands of tokens —
+        the meter said 1.4k while the run was billed 91k across seven calls.
+        A measurement always wins over an estimate; the estimate wins over a
+        stale or prefix-cached measurement, which is why this is a max and not
+        a preference.
+
+        Reported, not enforced. Compaction still runs off `approx_tokens`: on
+        the managed path the working context belongs to the helper thread, and
+        summarizing Locus's own near-empty transcript because the helper's
+        window is filling would discard the wrong conversation.
+        """
+        return max(self.approx_tokens(), self.measured_context_tokens())
+
     def session_info(self) -> dict[str, Any]:
-        approx = self.approx_tokens()
+        approx = self.context_tokens()
         environment = {
             "type": "worktree" if self.task_metadata is not None else "local",
             "isolation": "managed_worktree" if self.task_metadata is not None else "local",
@@ -2123,6 +2213,11 @@ class AgentCore:
                                     native_model_calls += 1
                                     native_prompt_tokens += prompt
                                     native_completion_tokens += completion
+                                if prompt:
+                                    # The helper holds the working context, so
+                                    # this is the only honest measure of what
+                                    # the window is carrying.
+                                    self._measured_prompt_tokens = prompt
                     elif method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
                         raise RuntimeError("ChatGPT helper requested a disabled native approval")
 
@@ -2535,6 +2630,9 @@ class AgentCore:
             # an optimistic shrink, so the tally stays slightly high — erring
             # toward evicting one more rather than one too few.
             self._last_call_tokens = max(0, self._last_call_tokens - dropped // 4)
+            self._measured_prompt_tokens = max(
+                0, self._measured_prompt_tokens - dropped // 4
+            )
             evicted += 1
         return evicted
 
@@ -2770,6 +2868,8 @@ class AgentCore:
             # the totals swallow them.
             self._last_call_tokens = resp.prompt_eval_count + resp.eval_count
             self._messages_at_last_call = len(self.messages)
+            if resp.prompt_eval_count > 0:
+                self._measured_prompt_tokens = resp.prompt_eval_count
             # A response proves the model is resident, so a window this turn
             # started without (cold start: nothing on /api/ps yet) is readable
             # now instead of a turn late. Free once known — refresh never
@@ -3424,6 +3524,14 @@ class AgentCore:
                         result = "Error: the Locus Vault is unavailable."
                     else:
                         result = self.wallet_executor(tc.name, tc.arguments, call_id)
+                elif info.get("origin") == "connector":
+                    connection_id = str(tc.arguments.get("connection_id") or "")
+                    if not self.tool_registry.connector_tool_allowed(tc.name, connection_id):
+                        result = "Error: this connector or operation is not allowed."
+                    elif self.connector_executor is None:
+                        result = "Error: connector actions are unavailable."
+                    else:
+                        result = self.connector_executor(tc.name, tc.arguments, call_id)
                 else:
                     result = (
                         execute_tool(tc.name, tc.arguments, self.tool_ctx)
@@ -3610,6 +3718,10 @@ class AgentCore:
                 "content": "[Summary of the earlier conversation, compacted to save context]\n" + summary,
             },
         ]
+        # The measurement described the conversation that was just replaced.
+        # Left standing it would hold the meter at the pre-compaction reading
+        # until the next model call, which is exactly when someone looks.
+        self._measured_prompt_tokens = 0
         # The helper thread still holds the full uncompacted history; keeping
         # it would silently undo the compaction on the next ChatGPT turn.
         self._clear_chatgpt_thread()

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+Synchronizes the shared runtime through Locus 2.3.0 development. Schedules and
+event triggers now own one durable agent chat and reuse its local checkout;
+overlapping occurrences are skipped without losing cadence. The runtime adds
+bounded Gmail, Telegram, signed-webhook, and price-feed event ingestion,
+deterministic filtering, durable delivery/retry state, connector-action
+idempotency receipts, and caller-scoped connector tool schemas whose secrets
+remain in the native owner. Platform-only browser, research, memory, speech,
+Autofill, and wallet-broker capabilities remain intact, and native wallet
+recovery presentation remains outside this shared protocol boundary.
+
 Synchronizes the shared runtime with Locus 2.1.0: Grill mode replaces the
 retired GSD build mode in the protocol (the old value stays accepted for older
 clients and stored schedules), agent questions surface as structured
