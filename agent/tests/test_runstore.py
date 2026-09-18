@@ -352,6 +352,27 @@ def test_current_schema_reopens_writable_without_reapplying_migrations(tmp_path)
         ).fetchone()[0] == SCHEMA_VERSION
 
 
+def test_a_newer_schema_opens_read_only_instead_of_writing(tmp_path) -> None:
+    path = tmp_path / "runs.sqlite3"
+    RunStore(path).start_run("written-by-the-newer-app")
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE schema_meta SET version=? WHERE singleton=1", (SCHEMA_VERSION + 1,)
+        )
+        connection.commit()
+
+    downgraded = RunStore(path)
+
+    assert downgraded.read_only is True
+    downgraded.start_run("must-not-be-written")
+    assert downgraded.run("must-not-be-written") is None
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT version FROM schema_meta WHERE singleton=1"
+        ).fetchone()[0] == SCHEMA_VERSION + 1
+    assert downgraded.run("written-by-the-newer-app") is not None
+
+
 def test_schema_v4_migrates_a_v3_store_and_records_turn_usage(tmp_path) -> None:
     path = tmp_path / "runs.sqlite3"
     first = RunStore(path)

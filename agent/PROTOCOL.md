@@ -661,7 +661,7 @@ The extension surface shares one error and concurrency contract:
 | POST | `/api/extensions/skills/import` | Import a skill. |
 | POST | `/api/extensions/skills/enable` | Enable or disable a skill. |
 | DELETE | `/api/extensions/skills/{skill_id:path}` | Remove a skill. |
-| POST | `/api/extensions/mcp` | Create or update an MCP server. `transport` is `"streamable_http"` or `"stdio"` — note the underscore. |
+| POST | `/api/extensions/mcp` | Create or update an MCP server. `transport` is `"streamable_http"`, `"stdio"`, or `"sse"` — note the underscore. This agent derives it from `url` vs `command` and never stores `"sse"`, but clients must accept an `"sse"` record from a Locus 3.1 backend. |
 | POST | `/api/extensions/mcp/presets/materialize` | Idempotently copy one reviewed preset into a normal user-editable server that is disabled globally. Supabase also requires `project_ref`. |
 | POST | `/api/extensions/mcp/enable` | Enable or disable a server. |
 | POST | `/api/extensions/mcp/test` | Probe a server's connectivity. |

@@ -346,7 +346,7 @@ export const PortableMemorySchema = z.array(PortableMemoryRecordSchema).max(5).s
 export const AgentUserMessageSchema = z.object({
   type: z.literal("user_message"),
   text: z.string().trim().min(1).max(200_000),
-  mode: z.enum(["ask", "work", "plan", "build"]).optional(),
+  mode: z.enum(["ask", "work", "plan", "grill", "build"]).optional(),
   browser_context: BrowserObservationContextSchema.optional(),
   portable_memory: PortableMemorySchema.optional(),
 }).passthrough();
