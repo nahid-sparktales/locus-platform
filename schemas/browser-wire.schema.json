@@ -292,7 +292,7 @@
       "properties": {
         "type": { "const": "user_message" },
         "text": { "type": "string", "minLength": 1, "maxLength": 200000 },
-        "mode": { "enum": ["ask", "work", "plan", "build"] },
+        "mode": { "enum": ["ask", "work", "plan", "grill", "build"] },
         "browser_context": { "$ref": "#/$defs/browserObservationContext" },
         "portable_memory": {
           "type": "array",
