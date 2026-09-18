@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -138,6 +139,12 @@ class RunStore:
             pass
         self._lock = threading.RLock()
         self.read_only = False
+        disk_version = self._existing_schema_version()
+        if disk_version is not None and disk_version > SCHEMA_VERSION:
+            # A downgraded app must not even enter the write-capable
+            # initializer: CREATE IF NOT EXISTS and WAL pragmas are writes.
+            self.read_only = True
+            return
         try:
             self._initialize()
         except (OSError, sqlite3.DatabaseError) as exc:
@@ -150,6 +157,23 @@ class RunStore:
             self.path.chmod(0o600)
         except OSError:
             pass
+
+    def _existing_schema_version(self) -> int | None:
+        if not self.path.exists():
+            return None
+        try:
+            with closing(self._connect(readonly=True)) as connection:
+                exists = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'"
+                ).fetchone()
+                if exists is None:
+                    return None
+                row = connection.execute(
+                    "SELECT version FROM schema_meta WHERE singleton=1"
+                ).fetchone()
+                return int(row[0]) if row is not None else None
+        except (OSError, sqlite3.DatabaseError, ValueError, TypeError):
+            return None
 
     def _connect(self, *, readonly: bool = False) -> sqlite3.Connection:
         if readonly or self.read_only:
@@ -299,6 +323,11 @@ class RunStore:
             version = int(connection.execute(
                 "SELECT version FROM schema_meta WHERE singleton=1"
             ).fetchone()[0])
+            if version > SCHEMA_VERSION:
+                raise sqlite3.DatabaseError(
+                    f"run database schema {version} is newer than supported schema "
+                    f"{SCHEMA_VERSION}"
+                )
             if version < 3:
                 connection.execute("BEGIN IMMEDIATE")
                 connection.execute("ALTER TABLE job_attempts ADD COLUMN provider TEXT")
