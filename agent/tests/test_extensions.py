@@ -223,10 +223,9 @@ def test_version_one_state_migrates_with_builtins_and_preserves_user_entries(tmp
     assert builtin["enabled"] is False
     assert next(item for item in skills if item["id"] == "frontend-design")["enabled"] is True
     bundled = [item for item in skills if item.get("builtin")]
-    assert len(bundled) == 26
+    assert len(bundled) == 25
     assert {
         "builtin:using-superpowers",
-        "builtin:task-observer",
         "builtin:grill-me",
         "builtin:grilling",
         "builtin:gsd-workflow",
@@ -258,16 +257,12 @@ def test_startup_skills_are_trusted_ordered_and_shadow_safe(tmp_path):
     manager = ExtensionManager(str(tmp_path), root=tmp_path / "state")
     assert [item["id"] for item in manager.startup_skills(str(tmp_path))] == [
         "builtin:using-superpowers",
-        "builtin:task-observer",
     ]
 
     registry = ToolRegistry(manager)
     registry.begin_turn("Use $grill-me to clarify this feature", str(tmp_path))
     context = registry.explicit_skill_context
     assert context.index("Startup skill $using-superpowers") < context.index(
-        "Startup skill $task-observer"
-    )
-    assert context.index("Startup skill $task-observer") < context.index(
         "Explicitly activated skill $builtin:grill-me"
     )
 
@@ -286,10 +281,7 @@ def test_bundled_skill_source_pins_and_activation_metadata(tmp_path):
     manager = ExtensionManager(str(tmp_path), root=tmp_path / "state")
     skills = {item["id"]: item for item in manager.skills(str(tmp_path))}
 
-    assert skills["builtin:task-observer"]["provenance"]["commit"] == (
-        "281f13466cd3a73e9ebc9d210907748e1941a3dd"
-    )
-    assert skills["builtin:task-observer"]["activation"] == "startup"
+    assert "builtin:task-observer" not in skills
     assert skills["builtin:using-superpowers"]["provenance"]["commit"] == (
         "b36e0829c6d0140e93cfef2ca599b1b07d4a7797"
     )
